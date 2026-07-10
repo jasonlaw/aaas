@@ -65,7 +65,7 @@ ok() {
 }
 
 warn() {
-  printf "%s!%s %s\n" "${YELLOW}${BOLD}" "${RESET}" "$1"
+  printf "%s!%s %s\n" "${YELLOW}${BOLD}" "${RESET}" "$1" >&2
 }
 
 fail() {
@@ -76,16 +76,9 @@ fail() {
 prompt_read() {
   local prompt="$1"
   local answer_var="$2"
-  local secret="${3:-}"
 
   if [[ -r /dev/tty ]]; then
-    if [[ "$secret" == "secret" ]]; then
-      read -r -s -p "$prompt" "$answer_var" </dev/tty
-    else
-      read -r -p "$prompt" "$answer_var" </dev/tty
-    fi
-  elif [[ "$secret" == "secret" ]]; then
-    read -r -s -p "$prompt" "$answer_var"
+    read -r -p "$prompt" "$answer_var" </dev/tty
   else
     read -r -p "$prompt" "$answer_var"
   fi
@@ -97,7 +90,7 @@ ask() {
   local answer
 
   if [[ -n "$default" ]]; then
-    prompt_read "$(printf "%s?%s %s [%s]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
+    prompt_read "$(printf "%s?%s %s [%s, Enter to accept]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
     printf "%s" "${answer:-$default}"
   else
     prompt_read "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer
@@ -105,11 +98,39 @@ ask() {
   fi
 }
 
+ask_required() {
+  local prompt="$1"
+  local default="${2:-}"
+  local answer
+
+  while true; do
+    answer="$(ask "$prompt" "$default")"
+    if [[ -n "$answer" ]]; then
+      printf "%s" "$answer"
+      return
+    fi
+    warn "$prompt is required."
+  done
+}
+
+ask_secret_required() {
+  local prompt="$1"
+  local answer
+
+  while true; do
+    answer="$(ask_secret "$prompt")"
+    if [[ -n "$answer" ]]; then
+      printf "%s" "$answer"
+      return
+    fi
+    warn "$prompt is required."
+  done
+}
+
 ask_secret() {
   local prompt="$1"
   local answer
-  prompt_read "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer secret
-  printf "\n" >&2
+  prompt_read "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer
   printf "%s" "$answer"
 }
 
@@ -118,13 +139,42 @@ yes_no() {
   local default="${2:-Y}"
   local answer
 
-  prompt_read "$(printf "%s?%s %s [%s/n]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
+  prompt_read "$(printf "%s?%s %s [%s/n, Enter to accept]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
   answer="${answer:-$default}"
   [[ "$answer" =~ ^[Yy] ]]
 }
 
 have() {
   command -v "$1" >/dev/null 2>&1
+}
+
+refresh_path() {
+  local dir
+  local extra_paths=(
+    "$HOME/.opencode/bin"
+    "$HOME/.hermes/bin"
+    "$HERMES_HOME/bin"
+    "$HOME/.local/bin"
+    "$HOME/.npm-global/bin"
+    "$HOME/.npm/bin"
+    "/usr/local/bin"
+    "/opt/homebrew/bin"
+  )
+
+  for dir in "${extra_paths[@]}"; do
+    [[ -d "$dir" ]] || continue
+    case ":$PATH:" in
+      *":$dir:"*) ;;
+      *) PATH="$dir:$PATH" ;;
+    esac
+  done
+  export PATH
+}
+
+install_banner() {
+  local name="$1"
+  printf "\n%s%s%s\n" "${MAGENTA}${BOLD}" "Installing ${name}" "${RESET}"
+  printf "%s\n" "------------------------"
 }
 
 config_value() {
@@ -200,7 +250,7 @@ select_hermes_provider() {
   printf "   m) Manual provider ID\n" >&2
 
   while true; do
-    prompt_read "$(printf "%s?%s Choose provider [%s]: " "${CYAN}${BOLD}" "${RESET}" "$default")" answer
+    prompt_read "$(printf "%s?%s Choose provider [%s, Enter to accept]: " "${CYAN}${BOLD}" "${RESET}" "$default")" answer
     answer="${answer:-$default}"
 
     if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#ids[@]} )); then
@@ -484,6 +534,7 @@ ensure_node() {
 ensure_opencode() {
   step "Installing opencode"
 
+  refresh_path
   if have opencode; then
     ok "opencode is already available at $(command -v opencode)."
     return
@@ -491,22 +542,28 @@ ensure_opencode() {
 
   local install_url="${OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
 
-  if yes_no "Install opencode using ${install_url}" "Y"; then
-    if ! curl -fsSL "$install_url" | bash; then
-      warn "opencode installer failed; trying npm fallback if available."
-    fi
+  install_banner "opencode"
+  if ! curl -fsSL "$install_url" | bash; then
+    warn "opencode installer failed; trying npm fallback if available."
   fi
 
+  refresh_path
   if ! have opencode && have npm; then
     if npm_global_has opencode-ai; then
+      refresh_path
       ok "opencode-ai is already installed globally."
     else
       warn "The installer did not place opencode on PATH. Trying npm as a fallback."
-      run npm install -g opencode-ai || true
+      if [[ -n "$SUDO" ]]; then
+        run $SUDO npm install -g opencode-ai || true
+      else
+        run npm install -g opencode-ai || true
+      fi
+      refresh_path
     fi
   fi
 
-  have opencode && ok "opencode is installed." || warn "opencode is not on PATH. The watchdog will still write alerts."
+  have opencode && ok "opencode is installed at $(command -v opencode)." || warn "opencode is not on PATH. The watchdog will still write alerts."
 }
 
 ensure_docker() {
@@ -588,7 +645,7 @@ install_hermes() {
     fallback_provider="$(select_hermes_provider "Fallback provider" "${existing_fallback_provider:-openrouter}")"
     fallback_model="$(ask "Fallback model" "${existing_fallback_model:-free}")"
     fallback_base_url="$(ask "Fallback base URL, blank for provider default" "$existing_fallback_base_url")"
-    fallback_key_env="$(ask "Fallback API key env var, blank for provider default" "$existing_fallback_key_env")"
+    fallback_key_env="$(ask_required "Fallback API key env var" "$existing_fallback_key_env")"
   else
     fallback_provider=""
     fallback_model=""
@@ -600,27 +657,37 @@ install_hermes() {
     if yes_no "Reuse existing Telegram bot token" "Y"; then
       telegram_token="$existing_token"
     else
-      telegram_token="$(ask_secret "Telegram bot token")"
+      telegram_token="$(ask_secret_required "Telegram bot token")"
     fi
   else
-    telegram_token="$(ask_secret "Telegram bot token")"
+    telegram_token="$(ask_secret_required "Telegram bot token")"
   fi
 
-  allowed_users="$(ask "Telegram user IDs, comma-separated" "$existing_users")"
-  home_channel="${allowed_users%%,*}"
-
-  if [[ -z "$allowed_users" || -z "$home_channel" ]]; then
-    fail "At least one Telegram user ID is required."
-  fi
+  while true; do
+    allowed_users="$(ask_required "Telegram user IDs, comma-separated" "$existing_users")"
+    home_channel="${allowed_users%%,*}"
+    if [[ -n "$home_channel" ]]; then
+      break
+    fi
+    warn "At least one Telegram user ID is required."
+  done
 
   install_url="${HERMES_INSTALL_URL:-$HERMES_OFFICIAL_INSTALL_URL}"
 
+  refresh_path
   if have hermes; then
     ok "Hermes is already available at $(command -v hermes)."
   elif [[ -f "$HERMES_INSTALL_MARKER" ]]; then
-    ok "Hermes installer marker already exists."
-  elif [[ -n "$install_url" ]]; then
+    warn "Hermes install marker exists, but hermes is not on PATH; reinstalling."
+    install_banner "Hermes"
     curl -fsSL "$install_url" | HERMES_HOME="$HERMES_HOME" bash
+    refresh_path
+    touch "$HERMES_INSTALL_MARKER"
+    ok "Hermes installer finished."
+  elif [[ -n "$install_url" ]]; then
+    install_banner "Hermes"
+    curl -fsSL "$install_url" | HERMES_HOME="$HERMES_HOME" bash
+    refresh_path
     touch "$HERMES_INSTALL_MARKER"
     ok "Hermes installer finished."
   else
