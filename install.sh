@@ -137,9 +137,15 @@ ask_secret() {
 yes_no() {
   local prompt="$1"
   local default="${2:-Y}"
-  local answer
+  local answer hint
 
-  prompt_read "$(printf "%s?%s %s [%s/n, Enter to accept]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
+  if [[ "$default" =~ ^[Yy] ]]; then
+    hint="Y/n, Enter for Y"
+  else
+    hint="y/N, Enter for N"
+  fi
+
+  prompt_read "$(printf "%s?%s %s [%s]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$hint")" answer
   answer="${answer:-$default}"
   [[ "$answer" =~ ^[Yy] ]]
 }
@@ -167,7 +173,8 @@ refresh_path_from_profile() {
     profile_path="${profile_path/#\~/$HOME}"
     profile_path="${profile_path//\$HOME/$HOME}"
     path_add "$profile_path"
-  done < <(grep -Eo '(^|:)(~|\$HOME|/)[^:"'"'"' ]+/bin' "$profile" | sed 's/^://')
+  done < <(grep -Eo "(^|:)(~|\$HOME|/)[^:\"' ]+/bin" "$profile" 2>/dev/null | sed "s/^://" || true)
+  return 0
 }
 
 refresh_path() {
@@ -574,27 +581,23 @@ ensure_opencode() {
     return
   fi
 
-  local install_url="${OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
-
   install_banner "opencode"
-  if ! curl -fsSL "$install_url" | bash; then
-    warn "opencode install script could not fetch version information; trying npm fallback if available."
-  fi
-
-  refresh_path
-  if ! have opencode && have npm; then
+  if have npm; then
     if npm_global_has opencode-ai; then
-      refresh_path
       ok "opencode-ai is already installed globally."
     else
-      warn "The installer did not place opencode on PATH. Trying npm as a fallback."
       if [[ -n "$SUDO" ]]; then
-        run $SUDO npm install -g opencode-ai || true
+        run $SUDO npm install -g opencode-ai
       else
-        run npm install -g opencode-ai || true
+        run npm install -g opencode-ai
       fi
-      refresh_path
     fi
+    refresh_path
+  else
+    warn "npm is not available; trying opencode install script as a fallback."
+    local install_url="${OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
+    curl -fsSL "$install_url" | bash || warn "opencode install script could not fetch version information."
+    refresh_path
   fi
 
   have opencode && ok "opencode is installed at $(command -v opencode)." || warn "opencode is not on PATH. The watchdog will still write alerts."
