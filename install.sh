@@ -382,7 +382,7 @@ install_packages() {
 
 ensure_base_tools() {
   step "Preparing the runway"
-  local missing=()
+  local tool missing=()
 
   for tool in curl git; do
     have "$tool" || missing+=("$tool")
@@ -390,11 +390,10 @@ ensure_base_tools() {
 
   if [[ "${#missing[@]}" -gt 0 ]]; then
     install_packages "$(detect_pm)" "${missing[@]}" || true
+    for tool in "${missing[@]}"; do
+      have "$tool" || fail "$tool is required but is not installed."
+    done
   fi
-
-  for tool in curl git; do
-    have "$tool" || fail "$tool is required but is not installed."
-  done
 
   ensure_owned_dir "$ROOT_DIR"
   ensure_owned_dir "$PLATFORM_DIR"
@@ -553,40 +552,30 @@ ensure_docker() {
   have docker && ok "Docker is installed." || warn "Docker still needs manual installation."
 }
 
-# Provider, model, fallback provider, and Telegram/messaging setup are all
-# handled interactively by Hermes's own setup wizard (choose the "full
-# interactive setup" option when prompted after the installer runs). This
-# script no longer collects or writes any of that itself — it only owns
-# HERMES_HOME placement and the external skills directory.
+# Fully non-interactive Hermes install: --skip-setup skips the wizard
+# entirely (no provider/model/Telegram prompts), --non-interactive
+# auto-answers any remaining yes/no prompts with defaults, --skip-browser
+# skips the Playwright/Chromium step. Provider, model, fallback, and
+# Telegram are intentionally NOT configured here — run `hermes config set`
+# (or `hermes setup`) by hand after install.sh finishes. HERMES_HOME is
+# passed inline on the same command as the install, not just exported,
+# since the installer's own bootstrap phase (launcher script, PATH setup)
+# doesn't reliably inherit an exported var across the curl | bash pipe.
 install_hermes() {
   step "Installing Hermes"
 
   local install_url
   install_url="${HERMES_INSTALL_URL:-$HERMES_OFFICIAL_INSTALL_URL}"
 
-  # HERMES_HOME must be exported for the whole shell, not just prefixed on a
-  # single piped command — the setup wizard runs as its own process tree and
-  # needs to inherit this, or it silently falls back to $HOME/.hermes.
-  export HERMES_HOME
-
   refresh_path
-  if have hermes; then
+  if have hermes && [[ -d "$HERMES_HOME" ]]; then
     ok "Hermes is already available at $(command -v hermes)."
-  elif [[ -f "$HERMES_INSTALL_MARKER" ]]; then
-    warn "Hermes install marker exists, but hermes is not on PATH; reinstalling."
-    install_banner "Hermes"
-    curl -fsSL "$install_url" | bash -s -- --skip-browser
-    refresh_path
-    touch "$HERMES_INSTALL_MARKER"
-    ok "Hermes installer finished."
-  elif [[ -n "$install_url" ]]; then
-    install_banner "Hermes"
-    curl -fsSL "$install_url" | bash -s -- --skip-browser
-    refresh_path
-    touch "$HERMES_INSTALL_MARKER"
-    ok "Hermes installer finished."
   else
-    fail "Hermes official install URL is not configured. Set HERMES_OFFICIAL_INSTALL_URL or HERMES_INSTALL_URL."
+    install_banner "Hermes"
+    curl -fsSL "$install_url" | HERMES_HOME="$HERMES_HOME" bash -s -- --skip-setup --non-interactive --skip-browser
+    refresh_path
+    touch "$HERMES_INSTALL_MARKER"
+    ok "Hermes installer finished."
   fi
 
   cat >"$CONFIG_FILE" <<EOF
@@ -600,6 +589,9 @@ EOF
 
   write_hermes_config_yaml
   ok "Hermes external skills directory merged into ${HERMES_HOME}/config.yaml."
+
+  warn "Provider, model, fallback, and Telegram are not configured yet."
+  warn "Run: env HERMES_HOME=${HERMES_HOME} hermes setup   (or hermes config set ...)"
 }
 
 # Merges skills.external_dirs into the config.yaml produced by Hermes's own
@@ -774,8 +766,12 @@ verify_hermes_runtime() {
   hermes --help 2>/dev/null | grep -qi gateway || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
   ok "Hermes gateway command is available."
 
-  [[ -f "${HERMES_HOME}/config.yaml" ]] || fail "Hermes config.yaml not found at ${HERMES_HOME}/config.yaml. Did the setup wizard complete?"
-  ok "Hermes config.yaml is present at ${HERMES_HOME}."
+  if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
+    ok "Hermes config.yaml is present at ${HERMES_HOME}."
+  else
+    warn "Hermes config.yaml not found yet at ${HERMES_HOME}/config.yaml — expected, since --skip-setup was used."
+    warn "It will be created on first run: env HERMES_HOME=${HERMES_HOME} hermes doctor"
+  fi
 
   if have systemctl; then
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
