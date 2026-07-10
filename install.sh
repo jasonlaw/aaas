@@ -344,6 +344,9 @@ write_hermes_config_yaml() {
       printf "model:\n"
       printf "  provider: %s\n" "$(yaml_quote "$PROVIDER")"
       printf "  default: %s\n" "$(yaml_quote "$PROVIDER_MODEL")"
+      if [[ -n "${PROVIDER_KEY_ENV:-}" ]]; then
+        printf "  key_env: %s\n" "$(yaml_quote "$PROVIDER_KEY_ENV")"
+      fi
       printf "# END AaaS managed model\n"
     } >>"$tmp_config"
     ok "Hermes primary provider is configured in ${hermes_config}."
@@ -660,12 +663,13 @@ ensure_docker() {
 install_hermes() {
   step "Installing Hermes"
 
-  local provider provider_model telegram_token allowed_users home_channel install_url
+  local provider provider_model provider_key_env provider_api_key telegram_token allowed_users home_channel install_url
   local fallback_provider fallback_model fallback_base_url fallback_key_env
-  local existing_provider existing_model existing_token existing_users existing_fallback_provider existing_fallback_model
+  local existing_provider existing_model existing_provider_key_env existing_provider_api_key existing_token existing_users existing_fallback_provider existing_fallback_model
   local existing_fallback_base_url existing_fallback_key_env fallback_default
   existing_provider="${PROVIDER:-$(config_value PROVIDER || true)}"
   existing_model="${PROVIDER_MODEL:-$(config_value PROVIDER_MODEL || true)}"
+  existing_provider_key_env="${PROVIDER_KEY_ENV:-$(config_value PROVIDER_KEY_ENV || true)}"
   existing_token="${TELEGRAM_BOT_TOKEN:-$(config_value TELEGRAM_BOT_TOKEN || true)}"
   existing_users="${TELEGRAM_ALLOWED_USERS:-$(config_value TELEGRAM_ALLOWED_USERS || true)}"
   existing_fallback_provider="${FALLBACK_PROVIDER:-$(config_value FALLBACK_PROVIDER || true)}"
@@ -675,6 +679,24 @@ install_hermes() {
 
   provider="$(select_hermes_provider "Primary provider" "${existing_provider:-opencode-zen}")"
   provider_model="$(ask "Primary model" "${existing_model:-big-pickle}")"
+  while true; do
+    provider_key_env="$(ask_required "Primary API key env var" "$existing_provider_key_env")"
+    if [[ "$provider_key_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      break
+    fi
+    warn "Primary API key env var must be a valid shell variable name, for example OPENROUTER_API_KEY."
+  done
+  existing_provider_api_key="${!provider_key_env:-$(config_value "$provider_key_env" || true)}"
+  if [[ -n "$existing_provider_api_key" ]]; then
+    if yes_no "Reuse existing primary API key from $provider_key_env" "Y"; then
+      provider_api_key="$existing_provider_api_key"
+    else
+      provider_api_key="$(ask_secret_required "Primary API key value")"
+    fi
+  else
+    provider_api_key="$(ask_secret_required "Primary API key value")"
+  fi
+
 
   fallback_default="N"
   [[ -n "$existing_fallback_provider" && -n "$existing_fallback_model" ]] && fallback_default="Y"
@@ -737,6 +759,7 @@ AAAS_ROOT=${ROOT_DIR}
 HERMES_HOME=${HERMES_HOME}
 PROVIDER=${provider}
 PROVIDER_MODEL=${provider_model}
+PROVIDER_KEY_ENV=${provider_key_env}
 TELEGRAM_BOT_TOKEN=${telegram_token}
 TELEGRAM_ALLOWED_USERS=${allowed_users}
 TELEGRAM_HOME_CHANNEL=${home_channel}
@@ -745,6 +768,9 @@ FALLBACK_MODEL=${fallback_model}
 FALLBACK_BASE_URL=${fallback_base_url}
 FALLBACK_KEY_ENV=${fallback_key_env}
 EOF
+  if [[ -n "$provider_key_env" ]]; then
+    printf "%s=%s\n" "$provider_key_env" "$provider_api_key" >>"$CONFIG_FILE"
+  fi
   chmod 600 "$CONFIG_FILE"
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
