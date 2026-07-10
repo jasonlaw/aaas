@@ -73,16 +73,34 @@ fail() {
   exit 1
 }
 
+prompt_read() {
+  local prompt="$1"
+  local answer_var="$2"
+  local secret="${3:-}"
+
+  if [[ -r /dev/tty ]]; then
+    if [[ "$secret" == "secret" ]]; then
+      read -r -s -p "$prompt" "$answer_var" </dev/tty
+    else
+      read -r -p "$prompt" "$answer_var" </dev/tty
+    fi
+  elif [[ "$secret" == "secret" ]]; then
+    read -r -s -p "$prompt" "$answer_var"
+  else
+    read -r -p "$prompt" "$answer_var"
+  fi
+}
+
 ask() {
   local prompt="$1"
   local default="${2:-}"
   local answer
 
   if [[ -n "$default" ]]; then
-    read -r -p "$(printf "%s?%s %s [%s]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
+    prompt_read "$(printf "%s?%s %s [%s]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
     printf "%s" "${answer:-$default}"
   else
-    read -r -p "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer
+    prompt_read "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer
     printf "%s" "$answer"
   fi
 }
@@ -90,7 +108,7 @@ ask() {
 ask_secret() {
   local prompt="$1"
   local answer
-  read -r -s -p "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer
+  prompt_read "$(printf "%s?%s %s: " "${CYAN}${BOLD}" "${RESET}" "$prompt")" answer secret
   printf "\n" >&2
   printf "%s" "$answer"
 }
@@ -100,7 +118,7 @@ yes_no() {
   local default="${2:-Y}"
   local answer
 
-  read -r -p "$(printf "%s?%s %s [%s/n]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
+  prompt_read "$(printf "%s?%s %s [%s/n]: " "${CYAN}${BOLD}" "${RESET}" "$prompt" "$default")" answer
   answer="${answer:-$default}"
   [[ "$answer" =~ ^[Yy] ]]
 }
@@ -182,7 +200,7 @@ select_hermes_provider() {
   printf "   m) Manual provider ID\n" >&2
 
   while true; do
-    read -r -p "$(printf "%s?%s Choose provider [%s]: " "${CYAN}${BOLD}" "${RESET}" "$default")" answer
+    prompt_read "$(printf "%s?%s Choose provider [%s]: " "${CYAN}${BOLD}" "${RESET}" "$default")" answer
     answer="${answer:-$default}"
 
     if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#ids[@]} )); then
