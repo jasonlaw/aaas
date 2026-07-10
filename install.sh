@@ -148,13 +148,36 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+path_add() {
+  local dir="$1"
+
+  [[ -d "$dir" ]] || return 0
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) PATH="$dir:$PATH" ;;
+  esac
+}
+
+refresh_path_from_profile() {
+  local profile="$1"
+  local profile_path
+
+  [[ -f "$profile" ]] || return 0
+  while IFS= read -r profile_path; do
+    profile_path="${profile_path/#\~/$HOME}"
+    profile_path="${profile_path//\$HOME/$HOME}"
+    path_add "$profile_path"
+  done < <(grep -Eo '(^|:)(~|\$HOME|/)[^:"'"'"' ]+/bin' "$profile" | sed 's/^://')
+}
+
 refresh_path() {
-  local dir
+  local dir binary
   local extra_paths=(
     "$HOME/.opencode/bin"
+    "$HOME/.local/share/opencode/bin"
+    "$HOME/.local/bin"
     "$HOME/.hermes/bin"
     "$HERMES_HOME/bin"
-    "$HOME/.local/bin"
     "$HOME/.npm-global/bin"
     "$HOME/.npm/bin"
     "/usr/local/bin"
@@ -162,12 +185,19 @@ refresh_path() {
   )
 
   for dir in "${extra_paths[@]}"; do
-    [[ -d "$dir" ]] || continue
-    case ":$PATH:" in
-      *":$dir:"*) ;;
-      *) PATH="$dir:$PATH" ;;
-    esac
+    path_add "$dir"
   done
+
+  refresh_path_from_profile "$HOME/.profile"
+  refresh_path_from_profile "$HOME/.bashrc"
+  refresh_path_from_profile "$HOME/.bash_profile"
+  refresh_path_from_profile "$HOME/.zshrc"
+
+  if ! command -v opencode >/dev/null 2>&1 && have find; then
+    binary="$(find "$HOME/.opencode" "$HOME/.local" "$HOME/.cache" -type f -name opencode -perm /111 2>/dev/null | head -n 1 || true)"
+    [[ -z "$binary" ]] || path_add "$(dirname "$binary")"
+  fi
+
   export PATH
 }
 
@@ -349,6 +379,10 @@ run() {
   "$@"
 }
 
+run_apt() {
+  local lock_timeout="${APT_LOCK_TIMEOUT:-300}"
+  run $SUDO apt-get -o DPkg::Lock::Timeout="$lock_timeout" "$@"
+}
 write_alert() {
   local message="$1"
   local alert_path
@@ -462,8 +496,8 @@ install_packages() {
 
   case "$pm" in
     apt)
-      run $SUDO apt-get update
-      run $SUDO apt-get install -y "${packages[@]}"
+      run_apt update
+      run_apt install -y "${packages[@]}"
       ;;
     dnf)
       run $SUDO dnf install -y "${packages[@]}"
@@ -517,8 +551,8 @@ ensure_node() {
 
   case "$(detect_pm)" in
     apt)
-      run $SUDO apt-get update
-      run $SUDO apt-get install -y nodejs npm
+      run_apt update
+      run_apt install -y nodejs npm
       ;;
     dnf|yum|pacman|brew)
       install_packages "$(detect_pm)" nodejs npm || install_packages "$(detect_pm)" node npm || true
@@ -544,7 +578,7 @@ ensure_opencode() {
 
   install_banner "opencode"
   if ! curl -fsSL "$install_url" | bash; then
-    warn "opencode installer failed; trying npm fallback if available."
+    warn "opencode install script could not fetch version information; trying npm fallback if available."
   fi
 
   refresh_path
@@ -576,8 +610,8 @@ ensure_docker() {
 
   case "$(detect_pm)" in
     apt)
-      run $SUDO apt-get update
-      run $SUDO apt-get install -y ca-certificates curl gnupg
+      run_apt update
+      run_apt install -y ca-certificates curl gnupg
       run $SUDO install -m 0755 -d /etc/apt/keyrings
       if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -592,8 +626,8 @@ ensure_docker() {
       else
         ok "Docker apt source already exists."
       fi
-      run $SUDO apt-get update
-      run $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      run_apt update
+      run_apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
       ;;
     dnf)
       run $SUDO dnf install -y dnf-plugins-core
