@@ -49,10 +49,10 @@ fi
 trap 'fail "Installation stopped near line ${LINENO}."' ERR
 
 banner() {
-  printf "\n%s%s\n" "${BOLD}${MAGENTA}" "   ___    ___    ___    ____"
-  printf "%s\n" "  / _ |  / _ |  / _ |  / __/"
-  printf "%s\n" " / __ | / __ | / __ | _\\ \\  "
-  printf "%s\n" "/_/ |_|/_/ |_|/_/ |_|/___/  "
+  printf "\n%s%s\n" "${BOLD}${MAGENTA}" "   ___                ____"
+  printf "%s\n" "  / _ |  ___ _ ___ _ / __/"
+  printf "%s\n" " / __ | / _  |/ _  | _\\ \\ "
+  printf "%s\n" "/_/ |_| \\_,_| \\_,_|/___/ "
   printf "%s%s\n\n" "${CYAN}" "${APP_NAME} installer${RESET}"
 }
 
@@ -474,7 +474,9 @@ ensure_opencode() {
   local install_url="${OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
 
   if yes_no "Install opencode using ${install_url}" "Y"; then
-    curl -fsSL "$install_url" | bash
+    if ! curl -fsSL "$install_url" | bash; then
+      warn "opencode installer failed; trying npm fallback if available."
+    fi
   fi
 
   if ! have opencode && have npm; then
