@@ -2,13 +2,19 @@
 set -Eeuo pipefail
 
 APP_NAME="Agent as a Service"
-SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+SOURCE_DIR=""
+if [[ -n "$SCRIPT_PATH" && "$SCRIPT_PATH" != "bash" && "$SCRIPT_PATH" != "/dev/stdin" ]]; then
+  SOURCE_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+fi
 ROOT_DIR="${AAAS_ROOT:-/opt/aaas}"
 PLATFORM_DIR="${ROOT_DIR}/platform"
 HERMES_HOME="${PLATFORM_DIR}/.hermes"
 WATCHDOG_DIR="${PLATFORM_DIR}/watchdog"
 CONFIG_FILE="${HERMES_HOME}/.env"
 HERMES_INSTALL_MARKER="${HERMES_HOME}/.installed"
+AAAS_REPO_URL="${AAAS_REPO_URL:-https://github.com/jasonlaw/aaas.git}"
+AAAS_REPO_REF="${AAAS_REPO_REF:-master}"
 HERMES_OFFICIAL_INSTALL_URL="${HERMES_OFFICIAL_INSTALL_URL:-https://hermes-agent.nousresearch.com/install.sh}"
 LOG_FILE="${WATCHDOG_DIR}/watchdog.log"
 ALERT_DIR="${WATCHDOG_DIR}/alerts"
@@ -332,12 +338,22 @@ ensure_owned_dir() {
 sync_platform_files() {
   step "Cloning platform presetup"
 
-  local source_platform="${SOURCE_DIR}/platform"
+  local source_platform=""
+  local tmp_source=""
+
+  if [[ -n "$SOURCE_DIR" && -d "${SOURCE_DIR}/platform" ]]; then
+    source_platform="${SOURCE_DIR}/platform"
+  else
+    tmp_source="$(mktemp -d)"
+    git clone --depth 1 --branch "$AAAS_REPO_REF" "$AAAS_REPO_URL" "$tmp_source/aaas"
+    source_platform="${tmp_source}/aaas/platform"
+  fi
 
   [[ -d "$source_platform" ]] || fail "Source platform folder not found: $source_platform"
 
   if [[ "$(cd "$source_platform" && pwd -P)" == "$(cd "$PLATFORM_DIR" && pwd -P)" ]]; then
     ok "Platform source and target are the same; nothing to clone."
+    [[ -z "$tmp_source" ]] || rm -rf "$tmp_source"
     return
   fi
 
@@ -352,9 +368,9 @@ sync_platform_files() {
     cp -a "$source_platform/." "$PLATFORM_DIR/"
   fi
 
+  [[ -z "$tmp_source" ]] || rm -rf "$tmp_source"
   ok "Platform presetup files are in ${PLATFORM_DIR}."
 }
-
 detect_pm() {
   if have apt-get; then
     printf "apt"
