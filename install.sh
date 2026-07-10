@@ -707,9 +707,9 @@ install_hermes() {
   step "Installing Hermes"
 
   local provider provider_model provider_key_env provider_api_key telegram_token allowed_users home_channel install_url
-  local fallback_provider fallback_model fallback_base_url fallback_key_env
+  local fallback_provider fallback_model fallback_base_url fallback_key_env fallback_api_key
   local existing_provider existing_model existing_provider_key_env existing_provider_api_key existing_token existing_users existing_fallback_provider existing_fallback_model
-  local existing_fallback_base_url existing_fallback_key_env fallback_default
+  local existing_fallback_base_url existing_fallback_key_env existing_fallback_api_key fallback_default
   existing_provider="${PROVIDER:-$(config_value PROVIDER || true)}"
   existing_model="${PROVIDER_MODEL:-$(config_value PROVIDER_MODEL || true)}"
   existing_provider_key_env="${PROVIDER_KEY_ENV:-$(config_value PROVIDER_KEY_ENV || true)}"
@@ -754,11 +754,22 @@ install_hermes() {
       fi
       warn "Fallback API key env var must be a valid shell variable name, for example OPENROUTER_API_KEY."
     done
+    existing_fallback_api_key="${!fallback_key_env:-$(config_value "$fallback_key_env" || true)}"
+    if [[ -n "$existing_fallback_api_key" ]]; then
+      if yes_no "Reuse existing fallback API key from $fallback_key_env" "Y"; then
+        fallback_api_key="$existing_fallback_api_key"
+      else
+        fallback_api_key="$(ask_secret_required "Fallback API key value")"
+      fi
+    else
+      fallback_api_key="$(ask_secret_required "Fallback API key value")"
+    fi
   else
     fallback_provider=""
     fallback_model=""
     fallback_base_url=""
     fallback_key_env=""
+    fallback_api_key=""
   fi
 
   if [[ -n "$existing_token" ]]; then
@@ -819,6 +830,9 @@ FALLBACK_KEY_ENV=${fallback_key_env}
 EOF
   if [[ -n "$provider_key_env" ]]; then
     printf "%s=%s\n" "$provider_key_env" "$provider_api_key" >>"$CONFIG_FILE"
+  fi
+  if [[ -n "$fallback_key_env" ]]; then
+    printf "%s=%s\n" "$fallback_key_env" "$fallback_api_key" >>"$CONFIG_FILE"
   fi
   chmod 600 "$CONFIG_FILE"
   # shellcheck disable=SC1090
