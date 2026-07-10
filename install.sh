@@ -262,6 +262,49 @@ custom|Custom OpenAI-compatible endpoint
 EOF
 }
 
+is_env_var_name() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+provider_key_env_default() {
+  local provider="$1"
+
+  case "$provider" in
+    anthropic) printf "ANTHROPIC_API_KEY" ;;
+    arcee) printf "ARCEE_API_KEY" ;;
+    azure-foundry) printf "AZURE_API_KEY" ;;
+    bedrock) printf "AWS_ACCESS_KEY_ID" ;;
+    deepseek) printf "DEEPSEEK_API_KEY" ;;
+    gemini) printf "GEMINI_API_KEY" ;;
+    gmi) printf "GMI_API_KEY" ;;
+    huggingface) printf "HUGGINGFACE_API_KEY" ;;
+    kilocode) printf "KILOCODE_API_KEY" ;;
+    kimi-coding|kimi-coding-cn) printf "MOONSHOT_API_KEY" ;;
+    lmstudio) printf "LMSTUDIO_API_KEY" ;;
+    minimax|minimax-cn|minimax-oauth) printf "MINIMAX_API_KEY" ;;
+    nous) printf "NOUS_API_KEY" ;;
+    novita) printf "NOVITA_API_KEY" ;;
+    nvidia) printf "NVIDIA_API_KEY" ;;
+    ollama-cloud) printf "OLLAMA_API_KEY" ;;
+    openai-api|openai-codex) printf "OPENAI_API_KEY" ;;
+    openrouter) printf "OPENROUTER_API_KEY" ;;
+    opencode-zen) printf "OPENCODE_ZEN_API_KEY" ;;
+    opencode-go) printf "OPENCODE_GO_API_KEY" ;;
+    qwen-oauth|alibaba|alibaba-coding-plan) printf "DASHSCOPE_API_KEY" ;;
+    stepfun) printf "STEPFUN_API_KEY" ;;
+    tencent-tokenhub) printf "TENCENT_TOKENHUB_API_KEY" ;;
+    vertex) printf "GOOGLE_APPLICATION_CREDENTIALS" ;;
+    xai) printf "XAI_API_KEY" ;;
+    xiaomi) printf "XIAOMI_API_KEY" ;;
+    zai) printf "ZAI_API_KEY" ;;
+    copilot|copilot-acp) printf "GITHUB_TOKEN" ;;
+    custom) printf "CUSTOM_API_KEY" ;;
+    *)
+      printf "%s_API_KEY" "$(printf "%s" "$provider" | tr "[:lower:]-" "[:upper:]_" | sed "s/[^A-Z0-9_]/_/g")"
+      ;;
+  esac
+}
+
 select_hermes_provider() {
   local prompt="$1"
   local default="${2:-openrouter}"
@@ -680,8 +723,8 @@ install_hermes() {
   provider="$(select_hermes_provider "Primary provider" "${existing_provider:-opencode-zen}")"
   provider_model="$(ask "Primary model" "${existing_model:-big-pickle}")"
   while true; do
-    provider_key_env="$(ask_required "Primary API key env var" "$existing_provider_key_env")"
-    if [[ "$provider_key_env" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    provider_key_env="$(ask_required "Primary API key env var" "${existing_provider_key_env:-$(provider_key_env_default "$provider")}")"
+    if is_env_var_name "$provider_key_env"; then
       break
     fi
     warn "Primary API key env var must be a valid shell variable name, for example OPENROUTER_API_KEY."
@@ -704,7 +747,13 @@ install_hermes() {
     fallback_provider="$(select_hermes_provider "Fallback provider" "${existing_fallback_provider:-openrouter}")"
     fallback_model="$(ask "Fallback model" "${existing_fallback_model:-free}")"
     fallback_base_url="$(ask "Fallback base URL, blank for provider default" "$existing_fallback_base_url")"
-    fallback_key_env="$(ask_required "Fallback API key env var" "$existing_fallback_key_env")"
+    while true; do
+      fallback_key_env="$(ask_required "Fallback API key env var" "${existing_fallback_key_env:-$(provider_key_env_default "$fallback_provider")}")"
+      if is_env_var_name "$fallback_key_env"; then
+        break
+      fi
+      warn "Fallback API key env var must be a valid shell variable name, for example OPENROUTER_API_KEY."
+    done
   else
     fallback_provider=""
     fallback_model=""
