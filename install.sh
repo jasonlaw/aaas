@@ -1044,8 +1044,9 @@ verify_hermes_runtime() {
     run $SUDO "$HERMES_REAL_BIN" gateway install --system
     configure_hermes_gateway_service_env
 
-    # gateway start/status run as aaas via the wrapper (correct user) .
-    run_as_aaas "$HERMES_BIN" gateway start --system
+    # gateway start needs root to control systemd — use real binary directly.
+    # gateway status can run as aaas since it only reads service state.
+    run $SUDO "$HERMES_REAL_BIN" gateway start --system
 
     if ! run_as_aaas "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
       write_alert "Hermes gateway system service failed verification"
