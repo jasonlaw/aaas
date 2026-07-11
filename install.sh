@@ -1039,18 +1039,22 @@ verify_hermes_runtime() {
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
     [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
 
-    # gateway install writes to /etc/systemd/system/ so needs root — use the
+    # All gateway operations need root (they control/query systemd) — use the
     # real binary directly, bypassing the wrapper guard (which blocks non-aaas).
     run $SUDO "$HERMES_REAL_BIN" gateway install --system
     configure_hermes_gateway_service_env
 
-    # gateway start needs root to control systemd — use real binary directly.
-    # gateway status can run as aaas since it only reads service state.
-    run $SUDO "$HERMES_REAL_BIN" gateway start --system
+    # gateway install may have already started the service; only call start if
+    # it is not already running to avoid a non-zero exit on re-run.
+    if ! $SUDO "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
+      run $SUDO "$HERMES_REAL_BIN" gateway start --system
+    else
+      ok "Hermes gateway is already running."
+    fi
 
-    if ! run_as_aaas "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
+    if ! $SUDO "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
       write_alert "Hermes gateway system service failed verification"
-      fail "Hermes gateway system service is not running. Check: sudo -u ${AAAS_USER} hermes gateway status --system"
+      fail "Hermes gateway system service is not running. Check: sudo ${HERMES_REAL_BIN} gateway status --system"
     fi
     ok "Hermes gateway system service is running as ${AAAS_USER}."
   else
