@@ -759,18 +759,35 @@ EOF
 # every process — including `sudo -u aaas`, systemd units, and login shells —
 # without needing to source any profile or pass env vars explicitly.
 ensure_hermes_home_system_env() {
-  local line="HERMES_HOME=${HERMES_HOME}"
+  local export_line="export HERMES_HOME=${HERMES_HOME}"
+  local bare_line="HERMES_HOME=${HERMES_HOME}"
   local etc_env="/etc/environment"
+  local bashrc="${AAAS_HOME}/.bashrc"
+  local marker="# AaaS: HERMES_HOME"
 
-  if grep -Fxq "$line" "$etc_env" 2>/dev/null; then
+  # 1. /etc/environment — picked up by PAM at login and by sudo.
+  #    Used by systemd services and native Linux login sessions.
+  if grep -Fxq "$bare_line" "$etc_env" 2>/dev/null; then
     ok "HERMES_HOME already set in ${etc_env}."
-    return
+  else
+    $SUDO sed -i '/^HERMES_HOME=/d' "$etc_env"
+    printf "%s
+" "$bare_line" | $SUDO tee -a "$etc_env" >/dev/null
+    ok "Set HERMES_HOME in ${etc_env} (system-wide, for systemd and sudo)."
   fi
 
-  # Remove any stale HERMES_HOME line first, then append the correct one.
-  $SUDO sed -i '/^HERMES_HOME=/d' "$etc_env"
-  printf "%s\n" "$line" | $SUDO tee -a "$etc_env" >/dev/null
-  ok "Set HERMES_HOME=${HERMES_HOME} in ${etc_env} — system-wide, available to all processes running as ${AAAS_USER}."
+  # 2. AAAS_HOME/.bashrc — picked up by interactive shells.
+  #    Essential for WSL where PAM does not always load /etc/environment,
+  #    and also provides a reliable fallback on native Linux.
+  if grep -Fq "$marker" "$bashrc" 2>/dev/null; then
+    ok "HERMES_HOME already set in ${bashrc}."
+  else
+    printf "
+%s
+%s
+" "$marker" "$export_line"       | run_as_aaas tee -a "$bashrc" >/dev/null
+    ok "Set HERMES_HOME in ${bashrc} (for interactive shells and WSL)."
+  fi
 }
 
 # Install a guard wrapper at /usr/local/bin/hermes that:
@@ -1108,6 +1125,25 @@ summary() {
   elif have systemctl && systemctl is-enabled --quiet aaas-watchdog.service 2>/dev/null; then
     printf "%sService:%s        %s\n" "${BOLD}" "${RESET}" "aaas-watchdog.service enabled, not started (sudo systemctl start aaas-watchdog.service)"
   fi
+  printf "\n%sNext steps:%s\n" "${BOLD}" "${RESET}"
+  printf "  1. Complete provider and model configuration:\n"
+  printf "       ${BOLD}hermes setup${RESET}\n"
+  printf "     Follow the interactive wizard to set your API keys and preferred model.\n"
+  printf "\n"
+  printf "  2. (Optional) Add a fallback provider for reliability:\n"
+  printf "       ${BOLD}hermes fallback add${RESET}\n"
+  printf "\n"
+  printf "  3. (Optional) Configure messaging platform integrations (Telegram, etc.):\n"
+  printf "       ${BOLD}hermes gateway setup${RESET}\n"
+  printf "\n"
+  printf "  4. After any configuration change, restart the gateway to apply it:\n"
+  printf "       ${BOLD}sudo systemctl restart hermes-gateway${RESET}\n"
+  printf "\n"
+  printf "%sHermes gateway note:%s\n" "${BOLD}" "${RESET}"
+  printf "  The gateway is installed as a systemd system service, which means it\n"
+  printf "  starts automatically at boot and runs independently of any user session.\n"
+  printf "  This is intentional for a server deployment — ignore any Hermes prompt\n"
+  printf "  suggesting a switch to a per-user service.\n"
 }
 
 main() {
