@@ -23,6 +23,12 @@ HERMES_OFFICIAL_INSTALL_URL="${HERMES_OFFICIAL_INSTALL_URL:-https://hermes-agent
 LOG_FILE="${WATCHDOG_DIR}/watchdog.log"
 ALERT_DIR="${WATCHDOG_DIR}/alerts"
 
+# Dedicated service account that owns all AaaS files and runs all services.
+AAAS_USER="aaas"
+AAAS_GROUP="aaas"
+# The user who invoked this script (may equal AAAS_USER).
+LOGIN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
   BOLD="$(tput bold)"
   DIM="$(tput dim)"
@@ -45,12 +51,30 @@ else
   CYAN=""
 fi
 
+# Root-only operations (package installs, systemd unit files, /usr/local/bin
+# symlink, useradd/usermod) still go through sudo. Everything that operates
+# on files under ROOT_DIR runs as AAAS_USER via run_as_aaas / sudo -u aaas.
 SUDO=""
 if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
   SUDO="sudo"
 fi
 
 trap 'fail "Installation stopped near line ${LINENO}."' ERR
+
+# ---------------------------------------------------------------------------
+# run_as_aaas — run a command as the aaas user.
+#
+# If the current user IS aaas (LOGIN_USER == AAAS_USER, or EUID matches),
+# the command runs directly — no sudo needed or available for a nologin
+# system account.  Otherwise it delegates via `sudo -u aaas`.
+# ---------------------------------------------------------------------------
+run_as_aaas() {
+  if [[ "$(id -un)" == "$AAAS_USER" ]]; then
+    "$@"
+  else
+    $SUDO -u "$AAAS_USER" "$@"
+  fi
+}
 
 banner() {
   printf "\n%s%s\n" "${BOLD}${MAGENTA}" "   ___                ____"
@@ -249,16 +273,17 @@ run_apt() {
   local lock_timeout="${APT_LOCK_TIMEOUT:-300}"
   run $SUDO apt-get -o DPkg::Lock::Timeout="$lock_timeout" "$@"
 }
+
 write_alert() {
   local message="$1"
   local alert_path
 
   alert_path="${ALERT_DIR}/alert-$(date "+%Y%m%d-%H%M%S")-$$"
-  mkdir -p "$alert_path"
-  printf "[%s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$message" >"${alert_path}/alert.txt"
+  run_as_aaas mkdir -p "$alert_path"
+  printf "[%s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$message" | run_as_aaas tee "${alert_path}/alert.txt" >/dev/null
   warn "$message"
   if have opencode; then
-    opencode run "AaaS installer alert: $message. Inspect ${alert_path}/alert.txt, repair the issue, rerun install.sh if needed, then remove the folder ${alert_path} after picking up this alert." >>"$LOG_FILE" 2>&1 || true
+    (cd "$PLATFORM_DIR" && opencode run "AaaS installer alert: $message. Inspect ${alert_path}/alert.txt, repair the issue, rerun install.sh if needed, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -278,29 +303,75 @@ start_background_service() {
   fi
 
   printf "%s→%s starting %s\n" "${DIM}" "${RESET}" "$pattern"
-  nohup "$@" >>"$LOG_FILE" 2>&1 &
+  # Run the background service as the aaas user.
+  nohup run_as_aaas "$@" >>"$LOG_FILE" 2>&1 &
   sleep 3
 
   process_running "$pattern"
 }
 
+# Create dir and ensure it is owned by aaas:aaas with group-write so that
+# both the service account and members of the aaas group can write to it.
 ensure_owned_dir() {
   local dir="$1"
 
-  if [[ -d "$dir" ]]; then
-    ok "$dir already exists."
-    return
+  if [[ ! -d "$dir" ]]; then
+    if ! run_as_aaas mkdir -p "$dir" 2>/dev/null; then
+      [[ -n "$SUDO" ]] || fail "Cannot create $dir. Rerun as root or install sudo."
+      run $SUDO mkdir -p "$dir"
+    fi
   fi
 
-  if mkdir -p "$dir" 2>/dev/null; then
-    ok "Created $dir."
-    return
+  # Transfer ownership to aaas:aaas and grant group-write so that members of
+  # the aaas group (including the login user) can read/write the directory.
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$dir"
+  run $SUDO chmod 2775 "$dir"   # setgid bit: new files inherit aaas group
+
+  ok "Directory ready (owned by ${AAAS_USER}:${AAAS_GROUP}): $dir"
+}
+
+# ---------------------------------------------------------------------------
+# Dedicated service account
+# ---------------------------------------------------------------------------
+
+# Create the aaas system group and user if they do not already exist.
+# The user gets no login shell and its home directory is ROOT_DIR.
+# If the invoking user is different from aaas, they are added to the aaas
+# group so they can read/write files under ROOT_DIR.
+ensure_aaas_user() {
+  step "Ensuring '${AAAS_USER}' service account exists"
+
+  if ! getent group "$AAAS_GROUP" >/dev/null 2>&1; then
+    run $SUDO groupadd --system "$AAAS_GROUP"
+    ok "Created group ${AAAS_GROUP}."
+  else
+    ok "Group ${AAAS_GROUP} already exists."
   fi
 
-  [[ -n "$SUDO" ]] || fail "Cannot create $dir. Rerun as root or install sudo."
-  run $SUDO mkdir -p "$dir"
-  run $SUDO chown -R "$(id -u):$(id -g)" "$dir"
-  ok "Created $dir."
+  if ! id "$AAAS_USER" >/dev/null 2>&1; then
+    run $SUDO useradd \
+      --system \
+      --gid "$AAAS_GROUP" \
+      --home-dir "$ROOT_DIR" \
+      --no-create-home \
+      --shell /usr/sbin/nologin \
+      "$AAAS_USER"
+    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: /usr/sbin/nologin)."
+  else
+    ok "User ${AAAS_USER} already exists."
+  fi
+
+  # If the person running install.sh is not aaas, add them to the aaas group
+  # so they can read/write files under ROOT_DIR without needing sudo.
+  if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
+    if id -nG "$LOGIN_USER" 2>/dev/null | grep -qw "$AAAS_GROUP"; then
+      ok "${LOGIN_USER} is already a member of ${AAAS_GROUP}."
+    else
+      run $SUDO usermod -aG "$AAAS_GROUP" "$LOGIN_USER"
+      ok "Added ${LOGIN_USER} to the ${AAAS_GROUP} group."
+      warn "Group membership takes effect in new shells. Run 'newgrp ${AAAS_GROUP}' or log out/in."
+    fi
+  fi
 }
 
 sync_platform_files() {
@@ -331,14 +402,18 @@ sync_platform_files() {
     tar \
       --exclude='./.hermes/.env' \
       --exclude='./.hermes/.installed' \
-      -C "$source_platform" -cf - . | tar -C "$PLATFORM_DIR" -xf -
+      -C "$source_platform" -cf - . | run_as_aaas tar -C "$PLATFORM_DIR" -xf -
   else
-    cp -a "$source_platform/." "$PLATFORM_DIR/"
+    run_as_aaas cp -a "$source_platform/." "$PLATFORM_DIR/"
   fi
+
+  # Ensure all synced files are owned by aaas:aaas.
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$PLATFORM_DIR"
 
   [[ -z "$tmp_source" ]] || rm -rf "$tmp_source"
   ok "Platform presetup files are in ${PLATFORM_DIR}."
 }
+
 detect_pm() {
   if have apt-get; then
     printf "apt"
@@ -399,11 +474,11 @@ ensure_base_tools() {
     done
   fi
 
-  ensure_owned_dir "$ROOT_DIR"
-  ensure_owned_dir "$PLATFORM_DIR"
-  ensure_owned_dir "$HERMES_HOME"
-  ensure_owned_dir "$WATCHDOG_DIR"
-  ok "Installation folders are ready."
+  # Directories are created after ensure_aaas_user, so ownership can be set
+  # correctly. Here we just make sure ROOT_DIR exists so useradd --home-dir
+  # doesn't complain.
+  [[ -d "$ROOT_DIR" ]] || run $SUDO mkdir -p "$ROOT_DIR"
+  ok "Base tools are ready."
 }
 
 ensure_node() {
@@ -507,6 +582,15 @@ ensure_docker() {
 
   if have docker; then
     ok "Docker is already available."
+    # Add aaas user to the docker group so it can run containers without sudo.
+    if getent group docker >/dev/null 2>&1; then
+      if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
+        run $SUDO usermod -aG docker "$AAAS_USER"
+        ok "Added ${AAAS_USER} to the docker group."
+      else
+        ok "${AAAS_USER} is already in the docker group."
+      fi
+    fi
     return
   fi
 
@@ -553,18 +637,25 @@ ensure_docker() {
     run $SUDO systemctl enable --now docker || true
   fi
 
+  # Add aaas to docker group after install.
+  if getent group docker >/dev/null 2>&1; then
+    if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
+      run $SUDO usermod -aG docker "$AAAS_USER"
+      ok "Added ${AAAS_USER} to the docker group."
+    fi
+  fi
+
   have docker && ok "Docker is installed." || warn "Docker still needs manual installation."
 }
 
-# Fully non-interactive Hermes install: --skip-setup skips the wizard
-# entirely (no provider/model/Telegram prompts), --non-interactive
-# auto-answers any remaining yes/no prompts with defaults, --skip-browser
-# skips the Playwright/Chromium step. Provider, model, fallback, and
-# Telegram are intentionally NOT configured here — run `hermes config set`
-# (or `hermes setup`) by hand after install.sh finishes. HERMES_HOME is
-# passed inline on the same command as the install, not just exported,
-# since the installer's own bootstrap phase (launcher script, PATH setup)
-# doesn't reliably inherit an exported var across the curl | bash pipe.
+# Hermes is installed as the aaas user so that:
+#   - All files under HERMES_HOME are owned by aaas from birth
+#   - The binary lands in aaas's local path (e.g. /opt/aaas/.local/bin/hermes)
+#   - Anyone wanting to run `hermes` must do so as aaas (via run_as_aaas /
+#     sudo -u aaas), which naturally prevents bob from accidentally writing
+#     root-owned or bob-owned files into HERMES_HOME
+# ensure_hermes_wrapper installs a guard at /usr/local/bin/hermes that blocks
+# non-aaas users and passes through to the real binary for the aaas user.
 install_hermes() {
   step "Installing Hermes"
 
@@ -576,25 +667,35 @@ install_hermes() {
     ok "Hermes is already available at $(command -v hermes)."
   else
     install_banner "Hermes"
-    curl -fsSL "$install_url" | HERMES_HOME="$HERMES_HOME" bash -s -- --skip-setup --non-interactive --skip-browser
+    # Install as aaas: binary + data all land under aaas's home/local dirs,
+    # owned by aaas from the start. HOME is set to ROOT_DIR (/opt/aaas) so
+    # the installer uses that as the base rather than /root or /home/bob.
+    curl -fsSL "$install_url" | run_as_aaas \
+      env HOME="$ROOT_DIR" HERMES_HOME="$HERMES_HOME" \
+      bash -s -- --skip-setup --non-interactive --skip-browser
     refresh_path
-    touch "$HERMES_INSTALL_MARKER"
+    run_as_aaas touch "$HERMES_INSTALL_MARKER"
     ok "Hermes installer finished."
   fi
 
+  # Safety net: ensure HERMES_HOME and everything in it is owned by aaas.
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$HERMES_HOME"
+  run $SUDO chmod -R g+rX "$HERMES_HOME"
+
   have hermes || fail "hermes is not on PATH after install. Fix Hermes install, then rerun install.sh."
-  ensure_hermes_symlink
-  ensure_hermes_home_env
+  ensure_hermes_home_system_env
+  ensure_hermes_wrapper
 
   # Written to PLATFORM_DIR/.env, not HERMES_HOME/.env — install.sh never
   # touches Hermes's own directory, which is where `hermes setup` later
   # stores real provider config and secrets.
-  cat >"$CONFIG_FILE" <<EOF
+  run_as_aaas bash -c "cat >\"$CONFIG_FILE\"" <<EOF
 # Generated by install.sh
 AAAS_ROOT=${ROOT_DIR}
 HERMES_HOME=${HERMES_HOME}
 EOF
-  chmod 600 "$CONFIG_FILE"
+  run $SUDO chmod 660 "$CONFIG_FILE"
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$CONFIG_FILE"
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
@@ -602,61 +703,68 @@ EOF
   ok "Hermes config.yaml updated: external skills dir merged, provider/model commented out."
 
   warn "Provider, model, fallback, and Telegram are not configured yet."
-  warn "Run: env HERMES_HOME=${HERMES_HOME} hermes setup   (or hermes config set ...)"
+  warn "Run: sudo -u ${AAAS_USER} hermes setup"
 }
 
-# install.sh only sets HERMES_HOME for its own process — it doesn't persist
-# across future shells. Without this, `hermes` typed manually later falls
-# back to its own default ($HOME/.hermes) instead of the platform's home.
-# Persist it once, idempotently, into the invoking user's shell profile.
-ensure_hermes_home_env() {
-  local profile="${HOME}/.bashrc"
-  local line="export HERMES_HOME=${HERMES_HOME}"
+# Write HERMES_HOME to /etc/environment so it is available system-wide to
+# every process — including `sudo -u aaas`, systemd units, and login shells —
+# without needing to source any profile or pass env vars explicitly.
+ensure_hermes_home_system_env() {
+  local line="HERMES_HOME=${HERMES_HOME}"
+  local etc_env="/etc/environment"
 
-  if [[ -f "$profile" ]] && grep -Fxq "$line" "$profile"; then
-    ok "HERMES_HOME is already persisted in ${profile}."
+  if grep -Fxq "$line" "$etc_env" 2>/dev/null; then
+    ok "HERMES_HOME already set in ${etc_env}."
     return
   fi
 
-  printf "\n# Added by AaaS install.sh\n%s\n" "$line" >>"$profile"
-  ok "Persisted HERMES_HOME in ${profile}. Run 'source ${profile}' or open a new shell for it to take effect."
+  # Remove any stale HERMES_HOME line first, then append the correct one.
+  $SUDO sed -i '/^HERMES_HOME=/d' "$etc_env"
+  printf "%s\n" "$line" | $SUDO tee -a "$etc_env" >/dev/null
+  ok "Set HERMES_HOME=${HERMES_HOME} in ${etc_env} (system-wide, no env var needed when running as ${AAAS_USER})."
 }
 
-# sudo's secure_path strips the invoking user's PATH, so the hermes launcher
-# under ~/.local/bin (or $HERMES_HOME/hermes-agent/venv/bin) is invisible to
-# `sudo env HERMES_HOME=... hermes ...` even though the current shell can
-# find it fine. Symlink it into /usr/local/bin, which sudo always sees, and
-# export HERMES_BIN so every sudo call below uses the resolved absolute path
-# instead of relying on PATH lookup a second time.
+# Install a guard wrapper at /usr/local/bin/hermes that:
+#   - Allows the command through when running as aaas (systemd, sudo -u aaas)
+#   - Blocks anyone else (e.g. bob) with a clear error and usage hint
+# This prevents non-aaas users from accidentally writing files into HERMES_HOME
+# with the wrong ownership, which would break the gateway.
+# HERMES_HOME does not need to be passed explicitly — /etc/environment provides
+# it system-wide (set by ensure_hermes_home_system_env).
 HERMES_BIN=""
-ensure_hermes_symlink() {
-  local real_bin target="/usr/local/bin/hermes"
+ensure_hermes_wrapper() {
+  local real_bin wrapper="/usr/local/bin/hermes"
 
-  real_bin="$(command -v hermes)" || fail "Cannot resolve hermes binary path."
+  # Resolve the actual hermes binary from aaas's perspective.
+  real_bin="$(run_as_aaas bash -c 'command -v hermes || true')"
+  [[ -n "$real_bin" && "$real_bin" != "$wrapper" ]] \
+    || fail "Cannot resolve hermes binary path as ${AAAS_USER}."
 
   if [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]]; then
-    if [[ ! -e "$target" || "$(readlink -f "$target" 2>/dev/null)" != "$(readlink -f "$real_bin")" ]]; then
-      run $SUDO ln -sf "$real_bin" "$target"
-      ok "Symlinked ${target} -> ${real_bin} so sudo can find hermes."
-    else
-      ok "${target} already points to the current hermes binary."
-    fi
-    HERMES_BIN="$target"
+    $SUDO tee "$wrapper" >/dev/null <<WRAPPER
+#!/usr/bin/env bash
+# Managed by AaaS install.sh — do not edit manually.
+# Hermes must run as the '${AAAS_USER}' service account so that all files
+# written into HERMES_HOME are owned by '${AAAS_USER}' and readable by the
+# Hermes gateway service.
+if [[ "\$(id -un)" != "${AAAS_USER}" ]]; then
+  printf "Error: hermes must be run as the '%s' user.\\n" "${AAAS_USER}" >&2
+  printf "Use:   sudo -u %s hermes %s\\n" "${AAAS_USER}" '"\$@"' >&2
+  exit 1
+fi
+exec "${real_bin}" "\$@"
+WRAPPER
+    $SUDO chmod 755 "$wrapper"
+    ok "Installed hermes guard wrapper at ${wrapper} (blocks non-${AAAS_USER} users)."
+    HERMES_BIN="$wrapper"
   else
-    warn "No sudo available to symlink hermes into /usr/local/bin; using resolved path directly."
+    warn "No sudo available to install hermes wrapper into /usr/local/bin; using resolved path directly."
     HERMES_BIN="$real_bin"
   fi
 }
 
 # Merges skills.external_dirs into the config.yaml produced by Hermes's own
-# setup wizard, via a real YAML parse/merge (not text-append) so we don't
-# clobber sibling keys like skills.creation_nudge_interval or create
-# duplicate top-level YAML keys. Also comments out any top-level
-# provider/model block the Hermes installer may have written on its own —
-# install.sh runs Hermes install with --skip-setup deliberately (see
-# install_hermes) and shouldn't let a leftover default provider/model get
-# picked up silently. Commented rather than deleted so it's a one-line
-# uncomment to restore after running `hermes setup` for real.
+# setup wizard, via a real YAML parse/merge (not text-append).
 write_hermes_config_yaml() {
   local hermes_config="${HERMES_HOME}/config.yaml"
   local skills_dir="${PLATFORM_DIR}/.opencode/skills"
@@ -712,13 +820,17 @@ with open(path, "w") as f:
     f.write(dumped)
 PYEOF
 
-  chmod 600 "$hermes_config"
+  # Re-lock ownership/permissions after Python rewrote the file.
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_config"
+  run $SUDO chmod 660 "$hermes_config"
 }
 
 write_watchdog() {
   step "Creating the watchdog"
 
-  cat >"${WATCHDOG_DIR}/watchdog.sh" <<'EOF'
+  # Watchdog script runs as the aaas user (enforced by the systemd unit).
+  # No sudo needed inside: aaas owns every file it touches.
+  run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.sh'" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -729,11 +841,6 @@ ALERT_DIR="${SCRIPT_DIR}/alerts"
 LOG_FILE="${SCRIPT_DIR}/watchdog.log"
 
 source "$CONFIG_FILE"
-
-SUDO=""
-if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
-  SUDO="sudo"
-fi
 
 stamp() {
   date "+%Y-%m-%d %H:%M:%S"
@@ -751,7 +858,7 @@ alert() {
   printf "[%s] %s\n" "$(stamp)" "$*" >"${alert_path}/alert.txt"
   log "$*"
   if command -v opencode >/dev/null 2>&1; then
-    opencode run "AaaS watchdog alert: $*. Inspect ${alert_path}/alert.txt, repair Hermes or its gateway, then remove the folder ${alert_path} after picking up this alert." >>"$LOG_FILE" 2>&1 || true
+    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. Inspect ${alert_path}/alert.txt, repair Hermes or its gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -788,23 +895,26 @@ if [[ -z "$HERMES_BIN" ]]; then
   exit 1
 fi
 
-if ! $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
+# The watchdog runs as aaas (via systemd User=aaas), so no sudo needed.
+if ! "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
   log "Hermes gateway system service is not healthy; starting it."
-  if ! $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway start --system >>"$LOG_FILE" 2>&1; then
+  if ! "$HERMES_BIN" gateway start --system >>"$LOG_FILE" 2>&1; then
     alert "Failed to start Hermes gateway system service"
     exit 1
   fi
 fi
 
-if ! $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway status --system >>"$LOG_FILE" 2>&1; then
+if ! "$HERMES_BIN" gateway status --system >>"$LOG_FILE" 2>&1; then
   alert "Hermes gateway system service is not running"
   exit 1
 fi
 EOF
 
-  chmod +x "${WATCHDOG_DIR}/watchdog.sh"
+  run $SUDO chmod +x "${WATCHDOG_DIR}/watchdog.sh"
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "${WATCHDOG_DIR}/watchdog.sh"
 
-  cat >"${WATCHDOG_DIR}/watchdog.service" <<EOF
+  # systemd unit: runs as aaas:aaas — no sudo needed inside the script.
+  run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.service'" <<EOF
 [Unit]
 Description=AaaS Hermes watchdog
 After=network-online.target docker.service
@@ -812,11 +922,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=${AAAS_USER}
+Group=${AAAS_GROUP}
 EnvironmentFile=${CONFIG_FILE}
 ExecStart=${WATCHDOG_DIR}/watchdog.sh
 Restart=always
 RestartSec=20
-WorkingDirectory=${ROOT_DIR}
+WorkingDirectory=${PLATFORM_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -840,9 +952,13 @@ configure_hermes_gateway_service_env() {
   dropin_file="${dropin_dir}/aaas.conf"
 
   run $SUDO mkdir -p "$dropin_dir"
-  printf "[Service]\nEnvironment=HERMES_HOME=%s\nEnvironmentFile=%s\n" "$HERMES_HOME" "$CONFIG_FILE" | $SUDO tee "$dropin_file" >/dev/null
+  # Run the gateway as aaas:aaas and supply HERMES_HOME so the process finds
+  # its config without needing environment variables set by the calling shell.
+  printf "[Service]\nUser=%s\nGroup=%s\nEnvironmentFile=%s\n" \
+    "$AAAS_USER" "$AAAS_GROUP" "$CONFIG_FILE" \
+    | $SUDO tee "$dropin_file" >/dev/null
   run $SUDO systemctl daemon-reload
-  ok "Hermes gateway service ${unit_name} is pinned to ${HERMES_HOME}."
+  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} and ${HERMES_HOME}."
 }
 
 verify_hermes_runtime() {
@@ -852,37 +968,47 @@ verify_hermes_runtime() {
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
-  have hermes || fail "Hermes executable is not on PATH. Fix Hermes install, then rerun install.sh."
-  hermes --help 2>/dev/null | grep -qi gateway || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
+  # Verify hermes is reachable as the aaas user (it is installed under aaas's
+  # local path; /usr/local/bin/hermes symlink makes it visible system-wide).
+  run_as_aaas bash -c "command -v hermes" >/dev/null \
+    || fail "Hermes executable is not on PATH for ${AAAS_USER}. Fix Hermes install, then rerun install.sh."
+  run_as_aaas hermes --help 2>/dev/null | grep -qi gateway \
+    || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
   ok "Hermes gateway command is available."
 
   if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
     ok "Hermes config.yaml is present at ${HERMES_HOME}."
   else
     warn "Hermes config.yaml not found yet at ${HERMES_HOME}/config.yaml — expected, since --skip-setup was used."
-    warn "It will be created on first run: env HERMES_HOME=${HERMES_HOME} hermes doctor"
+    warn "It will be created on first run: sudo -u ${AAAS_USER} hermes doctor"
   fi
 
   if have systemctl; then
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
-    [[ -n "$HERMES_BIN" ]] || fail "HERMES_BIN is not set. ensure_hermes_symlink must run before verify_hermes_runtime."
-    run $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway install --system
-    configure_hermes_gateway_service_env
-    run $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway start --system
+    [[ -n "$HERMES_BIN" ]] || fail "HERMES_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
 
-    if ! $SUDO env HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
+    # Install the gateway unit as root, then immediately apply the aaas drop-in
+    # so it starts under the correct user on first activation.
+    run $SUDO "$HERMES_BIN" gateway install --system
+    configure_hermes_gateway_service_env
+
+    # Start the gateway; systemd will switch to aaas via the drop-in.
+    run $SUDO "$HERMES_BIN" gateway start --system
+
+    if ! run_as_aaas "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
       write_alert "Hermes gateway system service failed verification"
-      fail "Hermes gateway system service is not running. Check: sudo env HERMES_HOME=${HERMES_HOME} ${HERMES_BIN} gateway status --system"
+      fail "Hermes gateway system service is not running. Check: sudo -u ${AAAS_USER} ${HERMES_BIN} gateway status --system"
     fi
-    ok "Hermes gateway system service is running."
+    ok "Hermes gateway system service is running as ${AAAS_USER}."
   else
-    if ! start_background_service "hermes.*gateway" env HERMES_HOME="$HERMES_HOME" hermes gateway; then
+    if ! start_background_service "hermes.*gateway" hermes gateway; then
       write_alert "Hermes gateway failed to start"
       fail "Hermes gateway is not running. Fix gateway setup, then rerun install.sh."
     fi
     ok "Hermes gateway is running."
   fi
 }
+
 install_watchdog_service() {
   step "Enabling watchdog autostart"
 
@@ -903,25 +1029,38 @@ install_watchdog_service() {
   run $SUDO systemctl daemon-reload
   run $SUDO systemctl enable "$unit_name"
 
-  ok "Watchdog service enabled: ${unit_name}. Not started — start it manually when ready:"
+  ok "Watchdog service enabled: ${unit_name} (runs as ${AAAS_USER}). Not started — start it manually when ready:"
   ok "  sudo systemctl start ${unit_name}"
 }
 
 summary() {
   printf "\n%s%sInstallation complete.%s\n" "${GREEN}${BOLD}" "✨ " "${RESET}"
-  printf "%sHermes home:%s %s\n" "${BOLD}" "${RESET}" "$HERMES_HOME"
-  printf "%sConfig:%s      %s\n" "${BOLD}" "${RESET}" "$CONFIG_FILE"
-  printf "%sWatchdog:%s    %s\n" "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
+  printf "%sService account:%s %s:%s\n"   "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP"
+  printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "$HERMES_HOME"
+  printf "%sConfig:%s         %s\n"        "${BOLD}" "${RESET}" "$CONFIG_FILE"
+  printf "%sWatchdog:%s       %s\n"        "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
+  if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
+    printf "%sNote:%s           %s is now a member of the '%s' group.\n" \
+      "${BOLD}" "${RESET}" "$LOGIN_USER" "$AAAS_GROUP"
+    printf "                 Run ${BOLD}newgrp %s${RESET} or open a new shell to activate it.\n" "$AAAS_GROUP"
+    printf "                 To run hermes manually: ${BOLD}sudo -u %s hermes ...${RESET}\n" \
+      "$AAAS_USER"
+  fi
   if have systemctl && systemctl is-active --quiet aaas-watchdog.service 2>/dev/null; then
-    printf "%sService:%s     %s\n" "${BOLD}" "${RESET}" "aaas-watchdog.service active"
+    printf "%sService:%s        %s\n" "${BOLD}" "${RESET}" "aaas-watchdog.service active"
   elif have systemctl && systemctl is-enabled --quiet aaas-watchdog.service 2>/dev/null; then
-    printf "%sService:%s     %s\n" "${BOLD}" "${RESET}" "aaas-watchdog.service enabled, not started (sudo systemctl start aaas-watchdog.service)"
+    printf "%sService:%s        %s\n" "${BOLD}" "${RESET}" "aaas-watchdog.service enabled, not started (sudo systemctl start aaas-watchdog.service)"
   fi
 }
 
 main() {
   banner
   ensure_base_tools
+  ensure_aaas_user          # must come before ensure_owned_dir calls
+  ensure_owned_dir "$ROOT_DIR"
+  ensure_owned_dir "$PLATFORM_DIR"
+  ensure_owned_dir "$HERMES_HOME"
+  ensure_owned_dir "$WATCHDOG_DIR"
   sync_platform_files
   ensure_node
   ensure_opencode
