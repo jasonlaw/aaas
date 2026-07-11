@@ -28,6 +28,14 @@ AAAS_USER="aaas"
 AAAS_GROUP="aaas"
 # The user who invoked this script (may equal AAAS_USER).
 LOGIN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+# If the installer is already running as aaas (e.g. WSL default user), give
+# aaas an interactive shell so the operator can use it directly. Otherwise
+# aaas is a background service account and nologin is the safer default.
+if [[ "$LOGIN_USER" == "$AAAS_USER" ]]; then
+  AAAS_SHELL="/bin/bash"
+else
+  AAAS_SHELL="/usr/sbin/nologin"
+fi
 
 if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
   BOLD="$(tput bold)"
@@ -65,8 +73,8 @@ trap 'fail "Installation stopped near line ${LINENO}."' ERR
 # run_as_aaas — run a command as the aaas user.
 #
 # If the current user IS aaas (LOGIN_USER == AAAS_USER, or EUID matches),
-# the command runs directly — no sudo needed or available for a nologin
-# system account.  Otherwise it delegates via `sudo -u aaas`.
+# the command runs directly — no sudo needed (WSL scenario where aaas is
+# the primary login user, or any case where the installer runs as aaas).  Otherwise it delegates via `sudo -u aaas`.
 # ---------------------------------------------------------------------------
 run_as_aaas() {
   if [[ "$(id -un)" == "$AAAS_USER" ]]; then
@@ -354,11 +362,19 @@ ensure_aaas_user() {
       --gid "$AAAS_GROUP" \
       --home-dir "$ROOT_DIR" \
       --no-create-home \
-      --shell /usr/sbin/nologin \
+      --shell "$AAAS_SHELL" \
       "$AAAS_USER"
-    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: /usr/sbin/nologin)."
+    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."
   else
     ok "User ${AAAS_USER} already exists."
+    # Correct the shell if it doesn't match the expected value for this
+    # environment (e.g. re-running install.sh on WSL after a native install).
+    local current_shell
+    current_shell="$(getent passwd "$AAAS_USER" | cut -d: -f7)"
+    if [[ "$current_shell" != "$AAAS_SHELL" ]]; then
+      run $SUDO usermod --shell "$AAAS_SHELL" "$AAAS_USER"
+      ok "Updated ${AAAS_USER} shell: ${current_shell} → ${AAAS_SHELL}."
+    fi
   fi
 
   # If the person running install.sh is not aaas, add them to the aaas group
@@ -662,9 +678,8 @@ install_hermes() {
   local install_url
   install_url="${HERMES_INSTALL_URL:-$HERMES_OFFICIAL_INSTALL_URL}"
 
-  refresh_path
-  if have hermes && [[ -d "$HERMES_HOME" ]]; then
-    ok "Hermes is already available at $(command -v hermes)."
+  if run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" && [[ -d "$HERMES_HOME" ]]; then
+    ok "Hermes is already available."
   else
     install_banner "Hermes"
     # Install as aaas: binary + data all land under aaas's home/local dirs,
@@ -673,7 +688,6 @@ install_hermes() {
     curl -fsSL "$install_url" | run_as_aaas \
       env HOME="$ROOT_DIR" HERMES_HOME="$HERMES_HOME" \
       bash -s -- --skip-setup --non-interactive --skip-browser
-    refresh_path
     run_as_aaas touch "$HERMES_INSTALL_MARKER"
     ok "Hermes installer finished."
   fi
@@ -682,7 +696,8 @@ install_hermes() {
   run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$HERMES_HOME"
   run $SUDO chmod -R g+rX "$HERMES_HOME"
 
-  have hermes || fail "hermes is not on PATH after install. Fix Hermes install, then rerun install.sh."
+  run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" \
+    || fail "hermes is not on PATH for ${AAAS_USER} after install. Fix Hermes install, then rerun install.sh."
   ensure_hermes_home_system_env
   ensure_hermes_wrapper
 
@@ -736,7 +751,7 @@ ensure_hermes_wrapper() {
   local real_bin wrapper="/usr/local/bin/hermes"
 
   # Resolve the actual hermes binary from aaas's perspective.
-  real_bin="$(run_as_aaas bash -c 'command -v hermes || true')"
+  real_bin="$(run_as_aaas bash -li -c 'command -v hermes || true')"
   [[ -n "$real_bin" && "$real_bin" != "$wrapper" ]] \
     || fail "Cannot resolve hermes binary path as ${AAAS_USER}."
 
@@ -970,9 +985,9 @@ verify_hermes_runtime() {
 
   # Verify hermes is reachable as the aaas user (it is installed under aaas's
   # local path; /usr/local/bin/hermes symlink makes it visible system-wide).
-  run_as_aaas bash -c "command -v hermes" >/dev/null \
+  run_as_aaas bash -li -c "command -v hermes" >/dev/null \
     || fail "Hermes executable is not on PATH for ${AAAS_USER}. Fix Hermes install, then rerun install.sh."
-  run_as_aaas hermes --help 2>/dev/null | grep -qi gateway \
+  run_as_aaas bash -li -c "hermes --help 2>/dev/null" | grep -qi gateway \
     || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
   ok "Hermes gateway command is available."
 
