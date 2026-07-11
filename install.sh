@@ -390,6 +390,28 @@ ensure_aaas_user() {
   fi
 }
 
+
+# Ensure /opt/aaas/.bash_profile sources .bashrc so that `bash -li` (login
+# shell) reliably loads whatever PATH entries the Hermes installer wrote into
+# .bashrc. Without this, bash -li sources /etc/profile and ~/.bash_profile
+# only — NOT ~/.bashrc — so the Hermes bin dir is invisible to login shells.
+ensure_aaas_profile() {
+  local profile="${ROOT_DIR}/.bash_profile"
+  # Use a unique marker comment so the idempotency check is unambiguous —
+  # grep for the marker, not the actual shell line, to avoid quoting issues.
+  local marker="# AaaS: source .bashrc for login shells"
+
+  if [[ -f "$profile" ]] && grep -Fq "$marker" "$profile" 2>/dev/null; then
+    ok "${profile} already sources .bashrc."
+    return
+  fi
+
+  # Append the sourcing block. Using run_as_aaas tee -a avoids quoting
+  # issues with heredocs passed through sudo.
+  printf '\n%s\n%s\n' "$marker" '[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"'     | run_as_aaas tee -a "$profile" >/dev/null
+  ok "Updated ${profile} to source .bashrc for login shells."
+}
+
 sync_platform_files() {
   step "Cloning platform presetup"
 
@@ -751,7 +773,7 @@ ensure_hermes_wrapper() {
   local real_bin wrapper="/usr/local/bin/hermes"
 
   # Resolve the actual hermes binary from aaas's perspective.
-  real_bin="$(run_as_aaas bash -li -c 'command -v hermes || true')"
+  real_bin="$(run_as_aaas bash -li -c 'command -v hermes')"
   [[ -n "$real_bin" && "$real_bin" != "$wrapper" ]] \
     || fail "Cannot resolve hermes binary path as ${AAAS_USER}."
 
@@ -985,8 +1007,8 @@ verify_hermes_runtime() {
 
   # Verify hermes is reachable as the aaas user (it is installed under aaas's
   # local path; /usr/local/bin/hermes symlink makes it visible system-wide).
-  run_as_aaas bash -li -c "command -v hermes" >/dev/null \
-    || fail "Hermes executable is not on PATH for ${AAAS_USER}. Fix Hermes install, then rerun install.sh."
+  run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" \
+    || fail "hermes is not on PATH for ${AAAS_USER}. Fix Hermes install, then rerun install.sh."
   run_as_aaas bash -li -c "hermes --help 2>/dev/null" | grep -qi gateway \
     || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
   ok "Hermes gateway command is available."
@@ -1076,6 +1098,7 @@ main() {
   ensure_owned_dir "$PLATFORM_DIR"
   ensure_owned_dir "$HERMES_HOME"
   ensure_owned_dir "$WATCHDOG_DIR"
+  ensure_aaas_profile         # must run before install_hermes
   sync_platform_files
   ensure_node
   ensure_opencode
