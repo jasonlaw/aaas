@@ -26,6 +26,9 @@ ALERT_DIR="${WATCHDOG_DIR}/alerts"
 # Dedicated service account that owns all AaaS files and runs all services.
 AAAS_USER="aaas"
 AAAS_GROUP="aaas"
+# Resolved after ensure_aaas_user() runs — always derived from /etc/passwd
+# so it is correct whether aaas was just created or already existed.
+AAAS_HOME=""
 # The user who invoked this script (may equal AAAS_USER).
 LOGIN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 # If the installer is already running as aaas (e.g. WSL default user), give
@@ -364,7 +367,7 @@ ensure_aaas_user() {
       --no-create-home \
       --shell "$AAAS_SHELL" \
       "$AAAS_USER"
-    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."
+    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."  # AAAS_HOME resolved below
   else
     ok "User ${AAAS_USER} already exists."
     # Correct the shell if it doesn't match the expected value for this
@@ -376,6 +379,13 @@ ensure_aaas_user() {
       ok "Updated ${AAAS_USER} shell: ${current_shell} → ${AAAS_SHELL}."
     fi
   fi
+
+  # Always derive AAAS_HOME from /etc/passwd — works whether aaas was just
+  # created with --home-dir ROOT_DIR, or already existed with a different home
+  # (e.g. WSL pre-created aaas with /home/aaas).
+  AAAS_HOME="$(getent passwd "$AAAS_USER" | cut -d: -f6)"
+  [[ -n "$AAAS_HOME" ]] || fail "Cannot determine home directory for ${AAAS_USER} from /etc/passwd."
+  ok "Resolved ${AAAS_USER} home: ${AAAS_HOME}."
 
   # If the person running install.sh is not aaas, add them to the aaas group
   # so they can read/write files under ROOT_DIR without needing sudo.
@@ -396,7 +406,7 @@ ensure_aaas_user() {
 # .bashrc. Without this, bash -li sources /etc/profile and ~/.bash_profile
 # only — NOT ~/.bashrc — so the Hermes bin dir is invisible to login shells.
 ensure_aaas_profile() {
-  local profile="${ROOT_DIR}/.bash_profile"
+  local profile="${AAAS_HOME}/.bash_profile"
   # Use a unique marker comment so the idempotency check is unambiguous —
   # grep for the marker, not the actual shell line, to avoid quoting issues.
   local marker="# AaaS: source .bashrc for login shells"
@@ -704,11 +714,13 @@ install_hermes() {
     ok "Hermes is already available."
   else
     install_banner "Hermes"
-    # Install as aaas: binary + data all land under aaas's home/local dirs,
-    # owned by aaas from the start. HOME is set to ROOT_DIR (/opt/aaas) so
-    # the installer uses that as the base rather than /root or /home/bob.
+    # Install as aaas: the OS sets HOME automatically from /etc/passwd so
+    # hermes lands in the correct home regardless of whether aaas was freshly
+    # created (/opt/aaas) or pre-existed (e.g. WSL /home/aaas). HERMES_HOME
+    # is passed explicitly as a safety belt in case /etc/environment is not
+    # yet loaded in this pipe context.
     curl -fsSL "$install_url" | run_as_aaas \
-      env HOME="$ROOT_DIR" HERMES_HOME="$HERMES_HOME" \
+      env HERMES_HOME="$HERMES_HOME" \
       bash -s -- --skip-setup --non-interactive --skip-browser
     run_as_aaas touch "$HERMES_INSTALL_MARKER"
     ok "Hermes installer finished."
@@ -758,7 +770,7 @@ ensure_hermes_home_system_env() {
   # Remove any stale HERMES_HOME line first, then append the correct one.
   $SUDO sed -i '/^HERMES_HOME=/d' "$etc_env"
   printf "%s\n" "$line" | $SUDO tee -a "$etc_env" >/dev/null
-  ok "Set HERMES_HOME=${HERMES_HOME} in ${etc_env} (system-wide, no env var needed when running as ${AAAS_USER})."
+  ok "Set HERMES_HOME=${HERMES_HOME} in ${etc_env} — system-wide, available to all processes running as ${AAAS_USER}."
 }
 
 # Install a guard wrapper at /usr/local/bin/hermes that:
@@ -1072,7 +1084,7 @@ install_watchdog_service() {
 
 summary() {
   printf "\n%s%sInstallation complete.%s\n" "${GREEN}${BOLD}" "✨ " "${RESET}"
-  printf "%sService account:%s %s:%s\n"   "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP"
+  printf "%sService account:%s %s:%s (home: %s)\n" "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP" "$AAAS_HOME"
   printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "$HERMES_HOME"
   printf "%sConfig:%s         %s\n"        "${BOLD}" "${RESET}" "$CONFIG_FILE"
   printf "%sWatchdog:%s       %s\n"        "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
