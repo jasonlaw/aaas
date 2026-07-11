@@ -781,6 +781,7 @@ ensure_hermes_home_system_env() {
 # HERMES_HOME does not need to be passed explicitly — /etc/environment provides
 # it system-wide (set by ensure_hermes_home_system_env).
 HERMES_BIN=""
+HERMES_REAL_BIN=""
 ensure_hermes_wrapper() {
   local real_bin wrapper="/usr/local/bin/hermes"
 
@@ -806,9 +807,11 @@ WRAPPER
     $SUDO chmod 755 "$wrapper"
     ok "Installed hermes guard wrapper at ${wrapper} (blocks non-${AAAS_USER} users)."
     HERMES_BIN="$wrapper"
+    HERMES_REAL_BIN="$real_bin"
   else
     warn "No sudo available to install hermes wrapper into /usr/local/bin; using resolved path directly."
     HERMES_BIN="$real_bin"
+    HERMES_REAL_BIN="$real_bin"
   fi
 }
 
@@ -1034,19 +1037,19 @@ verify_hermes_runtime() {
 
   if have systemctl; then
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
-    [[ -n "$HERMES_BIN" ]] || fail "HERMES_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
+    [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
 
-    # Install the gateway unit as root, then immediately apply the aaas drop-in
-    # so it starts under the correct user on first activation.
-    run $SUDO "$HERMES_BIN" gateway install --system
+    # gateway install writes to /etc/systemd/system/ so needs root — use the
+    # real binary directly, bypassing the wrapper guard (which blocks non-aaas).
+    run $SUDO "$HERMES_REAL_BIN" gateway install --system
     configure_hermes_gateway_service_env
 
-    # Start the gateway; systemd will switch to aaas via the drop-in.
-    run $SUDO "$HERMES_BIN" gateway start --system
+    # gateway start/status run as aaas via the wrapper (correct user) .
+    run_as_aaas "$HERMES_BIN" gateway start --system
 
     if ! run_as_aaas "$HERMES_BIN" gateway status --system >/dev/null 2>&1; then
       write_alert "Hermes gateway system service failed verification"
-      fail "Hermes gateway system service is not running. Check: sudo -u ${AAAS_USER} ${HERMES_BIN} gateway status --system"
+      fail "Hermes gateway system service is not running. Check: sudo -u ${AAAS_USER} hermes gateway status --system"
     fi
     ok "Hermes gateway system service is running as ${AAAS_USER}."
   else
