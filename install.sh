@@ -988,43 +988,33 @@ write_default_hermes_soul_bootstrap() {
 
 # Install Mnemosyne as Hermes's sole memory provider.
 #
-# Package: mnemosyne-memory[all] — the official Hermes integration package.
-# The [all] extra pulls in embeddings + LLM backends needed for consolidation.
+# Official method (docs.mnemosyne.site/integration/hermes):
+#   pip install mnemosyne-memory[all]  — inside the Hermes venv
+#   config.yaml: provider: mnemosyne  — already handled by bootstrap
 #
-# Memory config is injected via hermes.config.bootstrap.yaml (processed by
-# write_hermes_config_yaml). That sets:
-#   memory_enabled: false        — suppresses MEMORY.md/USER.md from prompt
-#   user_profile_enabled: false  — suppresses USER.md profile injection
-#   provider: mnemosyne          — routes all capture/recall to Mnemosyne
+# No symlink step, no `hermes config set` — Mnemosyne registers itself
+# via Python entry points once installed in the same venv Hermes uses.
 #
-# memory_enabled: false is safe here — per the official docs, when false the
-# built-in flat-file store is disabled but Mnemosyne tools still work. The
-# memory toolset gate is controlled separately by `hermes tools enable/disable
-# memory`, NOT by memory_enabled. Do NOT run `hermes tools disable memory` —
-# that kills all 23 Mnemosyne tools as well as the built-in tool.
+# The Hermes venv is built by uv with --no-pip (no pip binary in venv/bin/).
+# We bootstrap pip via ensurepip (confirmed: pip 24.0 available). Idempotent.
 #
-# NOTE on SOUL.md: SOUL.md content rides in the system prompt directly as a
-# context file — it is explicitly excluded from memory capture. It is not
-# seeded into the Mnemosyne database.
+# MNEMOSYNE_HOME pinned inside HERMES_HOME so the SQLite DB stays within
+# the managed platform tree (default ~ resolves to AAAS_HOME, outside ROOT_DIR).
 #
-# This function handles:
-#   1. Installing mnemosyne-memory[all] into the Hermes venv
-#   2. Symlinking the plugin so Hermes's scanner finds it
-#   3. Setting the active provider via hermes config set (non-interactive)
-#   4. Pinning MNEMOSYNE_HOME inside HERMES_HOME (default ~ resolves to
-#      AAAS_HOME, which is outside ROOT_DIR)
-#   5. Writing MNEMOSYNE_HOST_LLM_ENABLED=true so consolidation routes
-#      through Hermes's own LLM provider — no separate API key needed
+# MNEMOSYNE_HOST_LLM_ENABLED=true routes consolidation through Hermes's own
+# authenticated LLM provider — no separate API key needed.
+#
+# NOTE on SOUL.md: loaded directly into the system prompt by Hermes at session
+# start. Explicitly excluded from memory capture. Never seeded into Mnemosyne.
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
 
   local hermes_venv="${HERMES_HOME}/hermes-agent/venv"
   local venv_python="${hermes_venv}/bin/python"
-  local plugin_dir="${HERMES_HOME}/plugins/mnemosyne"
   local mnemosyne_home="${HERMES_HOME}/mnemosyne"
 
   # ------------------------------------------------------------------
-  # 1. Verify the Hermes venv exists (created by the official git installer).
+  # 1. Verify the Hermes venv exists.
   #    The bash wrapper at /usr/local/bin/hermes confirms the path:
   #      exec "${HERMES_HOME}/hermes-agent/venv/bin/hermes" "$@"
   # ------------------------------------------------------------------
@@ -1034,9 +1024,18 @@ install_mnemosyne() {
   ok "Hermes venv found at ${hermes_venv}."
 
   # ------------------------------------------------------------------
-  # 2. Install mnemosyne-hermes into the Hermes venv.
-  #    Pin >=0.2.0 — avoids a known resolver bug that serves 0.1.0 to
-  #    Python 3.11 environments (causes ModuleNotFoundError: mnemosyne.core).
+  # 2. Bootstrap pip into the venv.
+  #    Hermes venv is built by uv with --no-pip — no pip binary exists.
+  #    ensurepip installs pip 24.0 (confirmed available on this system).
+  #    --upgrade is a no-op when pip is already present — idempotent.
+  # ------------------------------------------------------------------
+  run_as_aaas "$venv_python" -m ensurepip --upgrade
+
+  # ------------------------------------------------------------------
+  # 3. Install mnemosyne-memory[all] into the Hermes venv.
+  #    [all] pulls in embeddings + LLM backends for consolidation.
+  #    Mnemosyne registers itself as a provider via Python entry points —
+  #    no symlink or plugin directory step required.
   # ------------------------------------------------------------------
   if run_as_aaas "$venv_python" -c "import mnemosyne" >/dev/null 2>&1; then
     local installed_ver
@@ -1049,33 +1048,8 @@ install_mnemosyne() {
   fi
 
   # ------------------------------------------------------------------
-  # 3. Symlink the installed package into HERMES_HOME/plugins/mnemosyne/
-  #    so Hermes's plugin scanner finds it. ln -sfn is idempotent.
-  # ------------------------------------------------------------------
-  local pkg_path
-  pkg_path="$(run_as_aaas "$venv_python" -c \
-    'import pathlib, mnemosyne; print(pathlib.Path(mnemosyne.__file__).resolve().parent)')"
-  [[ -n "$pkg_path" ]] || fail "Cannot resolve mnemosyne package path inside Hermes venv."
-
-  run_as_aaas mkdir -p "$plugin_dir"
-  run_as_aaas bash -c "ln -sfn \"${pkg_path}/\"* \"${plugin_dir}/\""
-  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$plugin_dir"
-  ok "mnemosyne-hermes symlinked into ${plugin_dir}."
-
-  # ------------------------------------------------------------------
-  # 4. Activate mnemosyne as the memory provider (non-interactive).
-  #    The config.yaml memory block (provider: mnemosyne) was already merged
-  #    by write_hermes_config_yaml via hermes.config.bootstrap.yaml.
-  #    This command makes it active in the running config state as well.
-  # ------------------------------------------------------------------
-  run_as_aaas bash -li -c "hermes config set memory.provider mnemosyne"
-  ok "Hermes memory provider set to mnemosyne."
-
-  # ------------------------------------------------------------------
-  # 5. Pin MNEMOSYNE_HOME inside HERMES_HOME so the SQLite database stays
-  #    in the managed platform tree. Without this, Mnemosyne resolves ~ from
-  #    the running process HOME, which for the aaas user is AAAS_HOME —
-  #    outside ROOT_DIR entirely.
+  # 4. Pin MNEMOSYNE_HOME inside HERMES_HOME so the SQLite database stays
+  #    in the managed platform tree.
   # ------------------------------------------------------------------
   if grep -Fq "MNEMOSYNE_HOME" "$CONFIG_FILE" 2>/dev/null; then
     ok "MNEMOSYNE_HOME already set in ${CONFIG_FILE}."
@@ -1085,7 +1059,7 @@ install_mnemosyne() {
   fi
 
   # ------------------------------------------------------------------
-  # 6. Route Mnemosyne's LLM consolidation calls through Hermes's own
+  # 5. Route Mnemosyne's LLM consolidation calls through Hermes's own
   #    authenticated provider — no separate API key or cloud service needed.
   # ------------------------------------------------------------------
   if grep -Fq "MNEMOSYNE_HOST_LLM_ENABLED" "$CONFIG_FILE" 2>/dev/null; then
