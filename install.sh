@@ -1020,7 +1020,6 @@ install_mnemosyne() {
 
   local hermes_venv="${HERMES_HOME}/hermes-agent/venv"
   local venv_python="${hermes_venv}/bin/python"
-  local venv_pip="${hermes_venv}/bin/pip"
   local plugin_dir="${HERMES_HOME}/plugins/mnemosyne"
   local mnemosyne_home="${HERMES_HOME}/mnemosyne"
 
@@ -1041,11 +1040,11 @@ install_mnemosyne() {
   # ------------------------------------------------------------------
   if run_as_aaas "$venv_python" -c "import mnemosyne" >/dev/null 2>&1; then
     local installed_ver
-    installed_ver="$(run_as_aaas "$venv_pip" show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
+    installed_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
     ok "mnemosyne-memory ${installed_ver} already installed in Hermes venv."
   else
     install_banner "mnemosyne-memory"
-    run_as_aaas "$venv_pip" install --quiet --upgrade "mnemosyne-memory[all]"
+    run_as_aaas "$venv_python" -m pip install --quiet --upgrade "mnemosyne-memory[all]"
     ok "mnemosyne-memory installed in Hermes venv."
   fi
 
