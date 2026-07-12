@@ -989,7 +989,10 @@ write_default_hermes_soul_bootstrap() {
 # Install Mnemosyne as Hermes's sole memory provider.
 #
 # Official method (docs.mnemosyne.site/integration/hermes):
-#   pip install mnemosyne-memory[all]  — inside the Hermes venv
+#   pip install mnemosyne-memory[embeddings]  — inside the Hermes venv
+#   (not [all]: MNEMOSYNE_HOST_LLM_ENABLED=true below routes consolidation
+#   through Hermes's own model, so the local LLM backend in [all] is
+#   unneeded weight — [embeddings] alone covers vector/hybrid recall)
 #   config.yaml: provider: mnemosyne  — already handled by bootstrap
 #
 # No symlink step, no `hermes config set` — Mnemosyne registers itself
@@ -1032,8 +1035,14 @@ install_mnemosyne() {
   run_as_aaas "$venv_python" -m ensurepip --upgrade
 
   # ------------------------------------------------------------------
-  # 3. Install mnemosyne-memory[all] into the Hermes venv.
-  #    [all] pulls in embeddings + LLM backends for consolidation.
+  # 3. Install mnemosyne-memory[embeddings] into the Hermes venv.
+  #    [embeddings] pulls in fastembed for local vector search.
+  #    We deliberately skip [all]: it also bundles sentence-transformers
+  #    + ctransformers (a local GGUF LLM runtime) for consolidation,
+  #    which is unnecessary here because MNEMOSYNE_HOST_LLM_ENABLED=true
+  #    (set below) routes consolidation/fact-extraction LLM calls through
+  #    Hermes's own authenticated provider instead. [embeddings] needs
+  #    ~2 GB free RAM vs. ~8 GB+ recommended for [all].
   #    Mnemosyne registers itself as a provider via Python entry points —
   #    no symlink or plugin directory step required.
   # ------------------------------------------------------------------
@@ -1043,7 +1052,7 @@ install_mnemosyne() {
     ok "mnemosyne-memory ${installed_ver} already installed in Hermes venv."
   else
     install_banner "mnemosyne-memory"
-    run_as_aaas "$venv_python" -m pip install --quiet --upgrade "mnemosyne-memory[all]"
+    run_as_aaas "$venv_python" -m pip install --quiet --upgrade "mnemosyne-memory[embeddings]"
     ok "mnemosyne-memory installed in Hermes venv."
   fi
 
