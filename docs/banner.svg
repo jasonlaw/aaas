@@ -1,0 +1,47 @@
+<svg viewBox="0 0 1200 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AaaS — Agent as a Service">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B1020"/>
+      <stop offset="100%" stop-color="#161233"/>
+    </linearGradient>
+    <linearGradient id="wordmark" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="55%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#F472B6"/>
+    </linearGradient>
+    <radialGradient id="pulseGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="260" rx="18" fill="url(#bg)"/>
+
+  <!-- faint grid, suggests infrastructure/server rack without being literal -->
+  <g stroke="#FFFFFF" stroke-opacity="0.045" stroke-width="1">
+    <line x1="0" y1="65" x2="1200" y2="65"/>
+    <line x1="0" y1="130" x2="1200" y2="130"/>
+    <line x1="0" y1="195" x2="1200" y2="195"/>
+    <line x1="150" y1="0" x2="150" y2="260"/>
+    <line x1="330" y1="0" x2="330" y2="260"/>
+    <line x1="1050" y1="0" x2="1050" y2="260"/>
+  </g>
+
+  <!-- always-on signal: a heartbeat/uptime trace running behind the wordmark -->
+  <polyline points="60,205 260,205 290,150 320,235 350,205 470,205 500,175 530,205 1140,205"
+    fill="none" stroke="#4C1D95" stroke-opacity="0.6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- live status dot, top-right: the "always-on" signature -->
+  <circle cx="1120" cy="56" r="26" fill="url(#pulseGlow)"/>
+  <circle cx="1120" cy="56" r="7" fill="#34D399"/>
+  <circle cx="1120" cy="56" r="7" fill="none" stroke="#34D399" stroke-width="2" stroke-opacity="0.6">
+    <animate attributeName="r" values="7;20;7" dur="2.4s" repeatCount="indefinite"/>
+    <animate attributeName="stroke-opacity" values="0.6;0;0.6" dur="2.4s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- wordmark -->
+  <text x="60" y="150" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="108" font-weight="800" fill="url(#wordmark)" letter-spacing="-2">AaaS</text>
+
+  <!-- tagline -->
+  <text x="64" y="190" font-family="'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace" font-size="21" fill="#A5B4FC" letter-spacing="0.5">Agent as a Service — Hermes on autopilot</text>
+</svg>

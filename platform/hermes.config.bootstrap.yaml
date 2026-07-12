@@ -1,0 +1,22 @@
+# Custom settings merged into Hermes's config.yaml by install.sh, then
+# deleted. Edit or delete this file (before running install.sh) if you want
+# different out-of-the-box behavior.
+#
+# - A key with a value here overwrites/merges that key in config.yaml.
+# - A commented-out top-level key (e.g. "#provider:") comments out that
+#   whole section in config.yaml instead of merging it.
+# - If this file doesn't exist at install time, config.yaml is left exactly
+#   as Hermes generated it.
+#
+# The path below is substituted by install.sh with the actual platform
+# directory (${AAAS_ROOT}/platform by default) after this file is synced
+# onto the target host — it's the one value that can't be known ahead of
+# time since AAAS_ROOT is configurable.
+
+skills:
+  external_dirs:
+    - __PLATFORM_DIR__/.opencode/skills
+
+# Left for `hermes setup` to configure interactively.
+#provider:
+#model:
