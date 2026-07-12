@@ -822,6 +822,14 @@ if [[ "\$(id -un)" != "${AAAS_USER}" ]]; then
   printf "Use:   sudo -u %s hermes %s\\n" "${AAAS_USER}" '"\$@"' >&2
   exit 1
 fi
+# HERMES_HOME is forced here rather than trusted from the caller's shell
+# environment. /etc/environment + .bashrc only take effect in fresh login
+# shells; a stale terminal, a non-login shell, or a sudo invocation that
+# doesn't re-read PAM env can silently drop HERMES_HOME, causing hermes to
+# fall back to its own default of \$HOME/.hermes (e.g. /home/${AAAS_USER}/.hermes)
+# instead of ${HERMES_HOME} — this is what caused config/.env to land in the
+# wrong place. Hardcoding it here makes every invocation deterministic.
+export HERMES_HOME="${HERMES_HOME}"
 exec "${real_bin}" "\$@"
 WRAPPER
     $SUDO chmod 755 "$wrapper"
