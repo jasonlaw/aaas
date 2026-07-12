@@ -986,6 +986,117 @@ write_default_hermes_soul_bootstrap() {
   ok "No default hermes.soul.bootstrap.md written; create one at ${bootstrap_file} to preset SOUL.md."
 }
 
+# Install Mnemosyne as Hermes's sole memory provider.
+#
+# Package: mnemosyne-memory[all] — the official Hermes integration package.
+# The [all] extra pulls in embeddings + LLM backends needed for consolidation.
+#
+# Memory config is injected via hermes.config.bootstrap.yaml (processed by
+# write_hermes_config_yaml). That sets:
+#   memory_enabled: false        — suppresses MEMORY.md/USER.md from prompt
+#   user_profile_enabled: false  — suppresses USER.md profile injection
+#   provider: mnemosyne          — routes all capture/recall to Mnemosyne
+#
+# memory_enabled: false is safe here — per the official docs, when false the
+# built-in flat-file store is disabled but Mnemosyne tools still work. The
+# memory toolset gate is controlled separately by `hermes tools enable/disable
+# memory`, NOT by memory_enabled. Do NOT run `hermes tools disable memory` —
+# that kills all 23 Mnemosyne tools as well as the built-in tool.
+#
+# NOTE on SOUL.md: SOUL.md content rides in the system prompt directly as a
+# context file — it is explicitly excluded from memory capture. It is not
+# seeded into the Mnemosyne database.
+#
+# This function handles:
+#   1. Installing mnemosyne-memory[all] into the Hermes venv
+#   2. Symlinking the plugin so Hermes's scanner finds it
+#   3. Setting the active provider via hermes config set (non-interactive)
+#   4. Pinning MNEMOSYNE_HOME inside HERMES_HOME (default ~ resolves to
+#      AAAS_HOME, which is outside ROOT_DIR)
+#   5. Writing MNEMOSYNE_HOST_LLM_ENABLED=true so consolidation routes
+#      through Hermes's own LLM provider — no separate API key needed
+install_mnemosyne() {
+  step "Installing Mnemosyne memory provider"
+
+  local hermes_venv="${HERMES_HOME}/hermes-agent/venv"
+  local venv_python="${hermes_venv}/bin/python"
+  local venv_pip="${hermes_venv}/bin/pip"
+  local plugin_dir="${HERMES_HOME}/plugins/mnemosyne"
+  local mnemosyne_home="${HERMES_HOME}/mnemosyne"
+
+  # ------------------------------------------------------------------
+  # 1. Verify the Hermes venv exists (created by the official git installer).
+  #    The bash wrapper at /usr/local/bin/hermes confirms the path:
+  #      exec "${HERMES_HOME}/hermes-agent/venv/bin/hermes" "$@"
+  # ------------------------------------------------------------------
+  if [[ ! -x "$venv_python" ]]; then
+    fail "Hermes venv not found at ${venv_python}. Confirm with: ls ${hermes_venv}/bin/"
+  fi
+  ok "Hermes venv found at ${hermes_venv}."
+
+  # ------------------------------------------------------------------
+  # 2. Install mnemosyne-hermes into the Hermes venv.
+  #    Pin >=0.2.0 — avoids a known resolver bug that serves 0.1.0 to
+  #    Python 3.11 environments (causes ModuleNotFoundError: mnemosyne.core).
+  # ------------------------------------------------------------------
+  if run_as_aaas "$venv_python" -c "import mnemosyne" >/dev/null 2>&1; then
+    local installed_ver
+    installed_ver="$(run_as_aaas "$venv_pip" show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
+    ok "mnemosyne-memory ${installed_ver} already installed in Hermes venv."
+  else
+    install_banner "mnemosyne-memory"
+    run_as_aaas "$venv_pip" install --quiet --upgrade "mnemosyne-memory[all]"
+    ok "mnemosyne-memory installed in Hermes venv."
+  fi
+
+  # ------------------------------------------------------------------
+  # 3. Symlink the installed package into HERMES_HOME/plugins/mnemosyne/
+  #    so Hermes's plugin scanner finds it. ln -sfn is idempotent.
+  # ------------------------------------------------------------------
+  local pkg_path
+  pkg_path="$(run_as_aaas "$venv_python" -c \
+    'import pathlib, mnemosyne; print(pathlib.Path(mnemosyne.__file__).resolve().parent)')"
+  [[ -n "$pkg_path" ]] || fail "Cannot resolve mnemosyne package path inside Hermes venv."
+
+  run_as_aaas mkdir -p "$plugin_dir"
+  run_as_aaas bash -c "ln -sfn \"${pkg_path}/\"* \"${plugin_dir}/\""
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$plugin_dir"
+  ok "mnemosyne-hermes symlinked into ${plugin_dir}."
+
+  # ------------------------------------------------------------------
+  # 4. Activate mnemosyne as the memory provider (non-interactive).
+  #    The config.yaml memory block (provider: mnemosyne) was already merged
+  #    by write_hermes_config_yaml via hermes.config.bootstrap.yaml.
+  #    This command makes it active in the running config state as well.
+  # ------------------------------------------------------------------
+  run_as_aaas bash -li -c "hermes config set memory.provider mnemosyne"
+  ok "Hermes memory provider set to mnemosyne."
+
+  # ------------------------------------------------------------------
+  # 5. Pin MNEMOSYNE_HOME inside HERMES_HOME so the SQLite database stays
+  #    in the managed platform tree. Without this, Mnemosyne resolves ~ from
+  #    the running process HOME, which for the aaas user is AAAS_HOME —
+  #    outside ROOT_DIR entirely.
+  # ------------------------------------------------------------------
+  if grep -Fq "MNEMOSYNE_HOME" "$CONFIG_FILE" 2>/dev/null; then
+    ok "MNEMOSYNE_HOME already set in ${CONFIG_FILE}."
+  else
+    printf "MNEMOSYNE_HOME=%s\n" "$mnemosyne_home" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
+    ok "MNEMOSYNE_HOME=${mnemosyne_home} written to ${CONFIG_FILE}."
+  fi
+
+  # ------------------------------------------------------------------
+  # 6. Route Mnemosyne's LLM consolidation calls through Hermes's own
+  #    authenticated provider — no separate API key or cloud service needed.
+  # ------------------------------------------------------------------
+  if grep -Fq "MNEMOSYNE_HOST_LLM_ENABLED" "$CONFIG_FILE" 2>/dev/null; then
+    ok "MNEMOSYNE_HOST_LLM_ENABLED already set in ${CONFIG_FILE}."
+  else
+    printf "MNEMOSYNE_HOST_LLM_ENABLED=true\n" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
+    ok "MNEMOSYNE_HOST_LLM_ENABLED=true written to ${CONFIG_FILE}."
+  fi
+}
+
 write_watchdog() {
   step "Creating the watchdog"
 
@@ -1203,6 +1314,7 @@ summary() {
   printf "\n%s%sInstallation complete.%s\n" "${GREEN}${BOLD}" "✨ " "${RESET}"
   printf "%sService account:%s %s:%s (home: %s)\n" "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP" "$AAAS_HOME"
   printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "$HERMES_HOME"
+  printf "%sMemory:%s         Mnemosyne → %s/mnemosyne/data/mnemosyne.db\n" "${BOLD}" "${RESET}" "$HERMES_HOME"
   printf "%sConfig:%s         %s\n"        "${BOLD}" "${RESET}" "$CONFIG_FILE"
   printf "%sWatchdog:%s       %s\n"        "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
   if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
@@ -1221,14 +1333,19 @@ summary() {
   printf "  1. Complete provider and model configuration:\n"
   printf "       ${BOLD}hermes setup${RESET}\n"
   printf "     Follow the interactive wizard to set your API keys and preferred model.\n"
+  printf "     Mnemosyne will route its consolidation calls through that same provider.\n"
   printf "\n"
-  printf "  2. (Optional) Add a fallback provider for reliability:\n"
+  printf "  2. Verify Mnemosyne is active:\n"
+  printf "       ${BOLD}sudo -u %s hermes doctor | grep -i memory${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes tools list | grep -i mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "\n"
+  printf "  3. (Optional) Add a fallback provider for reliability:\n"
   printf "       ${BOLD}hermes fallback add${RESET}\n"
   printf "\n"
-  printf "  3. (Optional) Configure messaging platform integrations (Telegram, etc.):\n"
+  printf "  4. (Optional) Configure messaging platform integrations (Telegram, etc.):\n"
   printf "       ${BOLD}hermes gateway setup${RESET}\n"
   printf "\n"
-  printf "  4. After any configuration change, restart the gateway to apply it:\n"
+  printf "  5. After any configuration change, restart the gateway to apply it:\n"
   printf "       ${BOLD}sudo systemctl restart hermes-gateway${RESET}\n"
   printf "\n"
   printf "%sHermes gateway note:%s\n" "${BOLD}" "${RESET}"
@@ -1253,6 +1370,7 @@ main() {
   ensure_python_yaml
   ensure_docker
   install_hermes
+  install_mnemosyne
   write_watchdog
   verify_hermes_runtime
   install_watchdog_service

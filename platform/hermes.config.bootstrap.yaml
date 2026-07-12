@@ -17,6 +17,20 @@ skills:
   external_dirs:
     - __PLATFORM_DIR__/.opencode/skills
 
+# Mnemosyne is the sole memory provider. memory_enabled and user_profile_enabled
+# are set to false to suppress MEMORY.md and USER.md from the system prompt —
+# Mnemosyne replaces them entirely. This is safe: when memory_enabled is false
+# the built-in flat-file store is gone but all Mnemosyne tools still work, because
+# the memory toolset gate (agent_init.py:1163-1172) is controlled separately by
+# `hermes tools enable/disable memory` — NOT by this config key.
+# Do NOT run `hermes tools disable memory` — that kills Mnemosyne tools too.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: mnemosyne
+  mnemosyne:
+    profile_isolation: false
+
 # Left for `hermes setup` to configure interactively.
 #provider:
 #model:
