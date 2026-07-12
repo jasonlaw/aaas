@@ -38,40 +38,48 @@ bash install.sh
 
 Docker installs automatically on supported package managers. On anything else, install Docker yourself first and rerun the installer.
 
-## Design: One Repo, One `HERMES_HOME`
+## Design: One Repo, Hermes At Its Own Default Home
 
-Everything AaaS manages lives under a single root, `/opt/aaas` by default:
+AaaS's own config/state lives under a single root, `/opt/aaas` by default. `HERMES_HOME` is deliberately **not** nested under it — Hermes is installed as the `aaas` service account and left at its own default location, `AAAS_HOME/.hermes` (e.g. `/opt/aaas/.hermes` if `aaas` was freshly created, or `/home/aaas/.hermes` if `aaas` pre-existed, per `/etc/passwd`). An earlier version of this installer pinned `HERMES_HOME` to a custom path under `platform/` and force-exported it everywhere (`/etc/environment`, `.bashrc`, a wrapper-level `export`) — that proved unreliable across shells/services and was removed in favor of just using Hermes's own default, which every process resolves identically from `/etc/passwd` with no extra plumbing.
 
 ```text
-/opt/aaas/
+/opt/aaas/                     ← ROOT_DIR
 └── platform/                  ← PLATFORM_DIR — install.sh-owned config & state
-    ├── .env                   ← AAAS_ROOT, HERMES_HOME (sourced by watchdog & wrapper)
-    ├── .hermes/                ← HERMES_HOME — Hermes's own directory
-    │   ├── hermes-agent/       ← Hermes code + venv (the actual install)
-    │   ├── config.yaml         ← Hermes's generated config
-    │   ├── SOUL.md             ← Hermes's agent identity
-    │   └── .env                ← Telegram tokens, provider keys (Hermes-owned secrets)
+    ├── .env                   ← AAAS_ROOT, HERMES_HOME (informational; sourced by watchdog & the gateway's systemd EnvironmentFile)
+    ├── .hermes/                ← staging dir ONLY — one-shot bootstrap files, NOT HERMES_HOME
+    │   ├── config.yaml         ← staging copy, applied then backed up with a timestamp
+    │   └── SOUL.md             ← staging copy, applied then backed up with a timestamp
     ├── .opencode/skills/       ← skills available to the admin opencode agent
     └── watchdog/
         ├── watchdog.sh
         ├── watchdog.log
         └── alerts/
+
+AAAS_HOME/                     ← e.g. /opt/aaas or /home/aaas, resolved from /etc/passwd
+└── .hermes/                   ← HERMES_HOME — Hermes's own default directory (untouched by install.sh)
+    ├── hermes-agent/          ← Hermes code + venv (the actual install)
+    ├── config.yaml            ← Hermes's generated config
+    ├── SOUL.md                ← Hermes's agent identity
+    ├── skills/                ← second external skills dir, merged in via config.yaml
+    └── .env                   ← Telegram tokens, provider keys (Hermes-owned secrets)
 ```
 
-One rule holds throughout `install.sh`: **it never writes into `HERMES_HOME` behind Hermes's back.** `hermes setup` owns `config.yaml`, `.env`, and `SOUL.md` once installed — those are Hermes's files, holding real secrets. Everything install.sh itself needs to track (like `AAAS_ROOT` and `HERMES_HOME`) lives one level up, in `PLATFORM_DIR/.env`.
+Note the naming collision to watch for: `PLATFORM_DIR/.hermes/` and `AAAS_HOME/.hermes/` are two different directories that happen to share a name. The former is a git-tracked staging folder for one-shot bootstrap files; the latter is the real `HERMES_HOME`, created and owned entirely by Hermes itself. `install.sh` never writes into the latter except via the documented bootstrap-apply step below.
+
+One rule holds throughout `install.sh`: **it never writes into `HERMES_HOME` behind Hermes's back.** `hermes setup` owns `config.yaml`, `.env`, and `SOUL.md` once installed — those are Hermes's files, holding real secrets. Everything install.sh itself needs to track (like `AAAS_ROOT` and the resolved `HERMES_HOME` path, for the watchdog and systemd) lives in `PLATFORM_DIR/.env`. Skills are surfaced from two places — `PLATFORM_DIR/.opencode/skills` (repo/install-managed) and `HERMES_HOME/skills` (Hermes-managed, e.g. self-created skills) — both listed in the staged `config.yaml`'s `skills.external_dirs`.
 
 ### Presetting Hermes without touching Hermes's files directly
 
-Sometimes you *do* want to hand Hermes a starting config or persona before it ever runs `hermes setup`. Rather than patching `config.yaml`/`SOUL.md` directly, drop a small staging file next to them and let the installer apply it once, then clean up after itself:
+Sometimes you *do* want to hand Hermes a starting config or persona before it ever runs `hermes setup`. Rather than patching `config.yaml`/`SOUL.md` directly, drop a small staging file in `PLATFORM_DIR/.hermes/` and let the installer apply it once, then clean up after itself:
 
-| Staging file (in `PLATFORM_DIR`) | Applied to | Behavior |
+| Staging file (in `PLATFORM_DIR/.hermes/`) | Applied to | Behavior |
 |---|---|---|
-| `hermes.config.bootstrap.yaml` | `HERMES_HOME/config.yaml` | deep-merged in; a commented-out top-level key (e.g. `#provider:`) comments that section out in `config.yaml` too |
-| `hermes.soul.bootstrap.md` | `HERMES_HOME/SOUL.md` | copied in as-is (plain Markdown, no merge semantics) |
+| `config.yaml` | `HERMES_HOME/config.yaml` | deep-merged in; a commented-out top-level key (e.g. `#provider:`) comments that section out in `config.yaml` too |
+| `SOUL.md` | `HERMES_HOME/SOUL.md` | copied in as-is (plain Markdown, no merge semantics) |
 
-Both are optional and both are just files under `platform/` in this repo — `hermes.config.bootstrap.yaml` ships tracked in git (its one placeholder, the platform directory path, is resolved by `install.sh` right after syncing, since `AAAS_ROOT` is configurable). Delete or edit it before running the installer to change what gets bootstrapped. Once applied, the staging file is removed on the target host — it's a one-shot bootstrap, not a synced overlay.
+Both are optional and both are just files under `platform/.hermes/` in this repo, sharing the same filenames as their real Hermes counterparts (`config.yaml`, `SOUL.md`) — `config.yaml` ships tracked in git (its placeholders, `__PLATFORM_DIR__` and `__HERMES_HOME__`, are resolved by `install.sh` right after syncing, since both are only known once `AAAS_ROOT` is set and `AAAS_HOME` is resolved from `/etc/passwd`). Delete or edit it before running the installer to change what gets bootstrapped. Once applied, the staging file is renamed to a timestamped backup on the target host (e.g. `config.yaml.applied-20260712-041530`) rather than deleted, so there's an audit trail of what was bootstrapped and when.
 
-Out of the box, `hermes.config.bootstrap.yaml` merges in the external skills directory and comments out `provider`/`model` so `hermes setup` drives those interactively.
+Out of the box, the staged `config.yaml` merges in both external skills directories and comments out `provider`/`model` so `hermes setup` drives those interactively.
 
 ## Installer Prompts
 
@@ -170,9 +178,10 @@ bash install.sh
 ├── install.sh
 ├── platform/
 │   ├── .hermes/
+│   │   ├── config.yaml
+│   │   └── SOUL.md
 │   ├── .opencode/
 │   │   └── skills/
-│   ├── hermes.config.bootstrap.yaml
 │   └── AGENTS.md
 └── README.md
 ```

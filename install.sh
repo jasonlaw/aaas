@@ -9,14 +9,12 @@ if [[ -n "$SCRIPT_PATH" && "$SCRIPT_PATH" != "bash" && "$SCRIPT_PATH" != "/dev/s
 fi
 ROOT_DIR="${AAAS_ROOT:-/opt/aaas}"
 PLATFORM_DIR="${ROOT_DIR}/platform"
-HERMES_HOME="${PLATFORM_DIR}/.hermes"
 WATCHDOG_DIR="${PLATFORM_DIR}/watchdog"
-# Platform-owned env file (AAAS_ROOT/HERMES_HOME) consumed by watchdog.sh and
-# the systemd units. Deliberately lives outside HERMES_HOME: install.sh must
-# never write into Hermes's own directory, since that's where `hermes setup`
-# later stores real provider config and secrets.
+# Platform-owned env file consumed by watchdog.sh and the systemd units.
+# Deliberately lives outside Hermes's own directory (AAAS_HOME/.hermes):
+# install.sh must never write into that directory, since that's where
+# `hermes setup` later stores real provider config and secrets.
 CONFIG_FILE="${PLATFORM_DIR}/.env"
-HERMES_INSTALL_MARKER="${HERMES_HOME}/.installed"
 AAAS_REPO_URL="${AAAS_REPO_URL:-https://github.com/jasonlaw/aaas.git}"
 AAAS_REPO_REF="${AAAS_REPO_REF:-master}"
 HERMES_OFFICIAL_INSTALL_URL="${HERMES_OFFICIAL_INSTALL_URL:-https://hermes-agent.nousresearch.com/install.sh}"
@@ -34,6 +32,12 @@ LOGIN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 # If the installer is already running as aaas (e.g. WSL default user), give
 # aaas an interactive shell so the operator can use it directly. Otherwise
 # aaas is a background service account and nologin is the safer default.
+# NOTE: this only decides the shell used at *creation* time. Whether an
+# *existing* account's shell gets touched afterward is handled separately
+# in ensure_aaas_user() — see the comment there for why upgrade-only logic
+# is required (WSL's pre-created interactive aaas account must never be
+# silently downgraded to nologin just because a different user runs this
+# installer).
 if [[ "$LOGIN_USER" == "$AAAS_USER" ]]; then
   AAAS_SHELL="/bin/bash"
 else
@@ -223,7 +227,7 @@ refresh_path() {
     "$HOME/.local/share/opencode/bin"
     "$HOME/.local/bin"
     "$HOME/.hermes/bin"
-    "$HERMES_HOME/bin"
+    "${AAAS_HOME:+$AAAS_HOME/.hermes/bin}"
     "$HOME/.npm-global/bin"
     "$HOME/.npm/bin"
     "/usr/local/bin"
@@ -370,13 +374,20 @@ ensure_aaas_user() {
     ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."  # AAAS_HOME resolved below
   else
     ok "User ${AAAS_USER} already exists."
-    # Correct the shell if it doesn't match the expected value for this
-    # environment (e.g. re-running install.sh on WSL after a native install).
+    # Only ever UPGRADE the shell (nologin -> bash), and only when we are
+    # currently running interactively as aaas ourselves. We deliberately
+    # never downgrade an existing shell (bash -> nologin): aaas may already
+    # be a real interactive account (e.g. WSL's pre-created default user),
+    # and a *different* login user rerunning this installer must not be
+    # able to silently lock that account down to nologin out from under
+    # whoever normally uses it.
     local current_shell
     current_shell="$(getent passwd "$AAAS_USER" | cut -d: -f7)"
-    if [[ "$current_shell" != "$AAAS_SHELL" ]]; then
-      run $SUDO usermod --shell "$AAAS_SHELL" "$AAAS_USER"
-      ok "Updated ${AAAS_USER} shell: ${current_shell} → ${AAAS_SHELL}."
+    if [[ "$LOGIN_USER" == "$AAAS_USER" && "$current_shell" != "/bin/bash" ]]; then
+      run $SUDO usermod --shell "/bin/bash" "$AAAS_USER"
+      ok "Updated ${AAAS_USER} shell: ${current_shell} → /bin/bash."
+    elif [[ "$current_shell" != "$AAAS_SHELL" ]]; then
+      ok "Leaving existing ${AAAS_USER} shell (${current_shell}) unchanged."
     fi
   fi
 
@@ -447,9 +458,12 @@ sync_platform_files() {
   ensure_owned_dir "$PLATFORM_DIR"
 
   if have tar; then
+    # PLATFORM_DIR/.hermes is a staging directory for one-shot bootstrap
+    # files only (config.yaml, SOUL.md) — it is NOT Hermes's own home
+    # directory (that lives at AAAS_HOME/.hermes, per README's "Design"
+    # section). Nothing under PLATFORM_DIR/.hermes holds real secrets, so
+    # no excludes are needed here.
     tar \
-      --exclude='./.hermes/.env' \
-      --exclude='./.hermes/.installed' \
       -C "$source_platform" -cf - . | run_as_aaas tar -C "$PLATFORM_DIR" -xf -
   else
     run_as_aaas cp -a "$source_platform/." "$PLATFORM_DIR/"
@@ -584,7 +598,7 @@ ensure_opencode() {
   have opencode && ok "opencode is installed at $(command -v opencode)." || warn "opencode is not on PATH. The watchdog will still write alerts."
 }
 
-# PyYAML is required to merge hermes.config.bootstrap.yaml into whatever
+# PyYAML is required to merge .hermes/config.yaml (staging) into whatever
 # config.yaml the Hermes setup wizard produces, without clobbering other
 # top-level keys (e.g. the wizard's own `skills.creation_nudge_interval`) or
 # introducing duplicate YAML keys.
@@ -697,11 +711,12 @@ ensure_docker() {
 }
 
 # Hermes is installed as the aaas user so that:
-#   - All files under HERMES_HOME are owned by aaas from birth
+#   - All files under Hermes's home (AAAS_HOME/.hermes) are owned by aaas
+#     from birth
 #   - The binary lands in aaas's local path (e.g. /opt/aaas/.local/bin/hermes)
 #   - Anyone wanting to run `hermes` must do so as aaas (via run_as_aaas /
 #     sudo -u aaas), which naturally prevents bob from accidentally writing
-#     root-owned or bob-owned files into HERMES_HOME
+#     root-owned or bob-owned files into Hermes's home directory
 # ensure_hermes_wrapper installs a guard at /usr/local/bin/hermes that blocks
 # non-aaas users and passes through to the real binary for the aaas user.
 install_hermes() {
@@ -710,38 +725,39 @@ install_hermes() {
   local install_url
   install_url="${HERMES_INSTALL_URL:-$HERMES_OFFICIAL_INSTALL_URL}"
 
-  if run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" && [[ -d "$HERMES_HOME" ]]; then
+  if run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" && [[ -d "${AAAS_HOME}/.hermes" ]]; then
     ok "Hermes is already available."
   else
     install_banner "Hermes"
-    # Install as aaas: the OS sets HOME automatically from /etc/passwd so
-    # hermes lands in the correct home regardless of whether aaas was freshly
-    # created (/opt/aaas) or pre-existed (e.g. WSL /home/aaas). HERMES_HOME
-    # is passed explicitly as a safety belt in case /etc/environment is not
-    # yet loaded in this pipe context.
+    # Install as aaas: the OS sets HOME automatically from /etc/passwd, so
+    # hermes lands at its own default (${AAAS_HOME}/.hermes) with no need to
+    # override it via an env var. An explicit override was tried previously
+    # and proved unreliable: it only takes effect in whichever shell/service
+    # actually has it in scope, and stale terminals, non-login shells, and
+    # sudo invocations that don't re-read PAM env silently fell back to
+    # Hermes's real default anyway, producing config/.env in a different
+    # place than intended. Letting Hermes use its own default removes that
+    # whole class of drift.
     curl -fsSL "$install_url" | run_as_aaas \
-      env HERMES_HOME="$HERMES_HOME" \
       bash -s -- --skip-setup --non-interactive --skip-browser
-    run_as_aaas touch "$HERMES_INSTALL_MARKER"
     ok "Hermes installer finished."
   fi
 
-  # Safety net: ensure HERMES_HOME and everything in it is owned by aaas.
-  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$HERMES_HOME"
-  run $SUDO chmod -R g+rX "$HERMES_HOME"
+  # Safety net: ensure Hermes's home directory and everything in it is
+  # owned by aaas.
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "${AAAS_HOME}/.hermes"
+  run $SUDO chmod -R g+rX "${AAAS_HOME}/.hermes"
 
   run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" \
     || fail "hermes is not on PATH for ${AAAS_USER} after install. Fix Hermes install, then rerun install.sh."
-  ensure_hermes_home_system_env
   ensure_hermes_wrapper
 
-  # Written to PLATFORM_DIR/.env, not HERMES_HOME/.env — install.sh never
-  # touches Hermes's own directory, which is where `hermes setup` later
-  # stores real provider config and secrets.
+  # Written to PLATFORM_DIR/.env, not AAAS_HOME/.hermes/.env — install.sh
+  # never touches Hermes's own directory, which is where `hermes setup`
+  # later stores real provider config and secrets.
   run_as_aaas bash -c "cat >\"$CONFIG_FILE\"" <<EOF
 # Generated by install.sh
 AAAS_ROOT=${ROOT_DIR}
-HERMES_HOME=${HERMES_HOME}
 EOF
   run $SUDO chmod 660 "$CONFIG_FILE"
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$CONFIG_FILE"
@@ -758,48 +774,15 @@ EOF
   warn "Run: sudo -u ${AAAS_USER} hermes setup"
 }
 
-# Write HERMES_HOME to /etc/environment so it is available system-wide to
-# every process — including `sudo -u aaas`, systemd units, and login shells —
-# without needing to source any profile or pass env vars explicitly.
-ensure_hermes_home_system_env() {
-  local export_line="export HERMES_HOME=${HERMES_HOME}"
-  local bare_line="HERMES_HOME=${HERMES_HOME}"
-  local etc_env="/etc/environment"
-  local bashrc="${AAAS_HOME}/.bashrc"
-  local marker="# AaaS: HERMES_HOME"
-
-  # 1. /etc/environment — picked up by PAM at login and by sudo.
-  #    Used by systemd services and native Linux login sessions.
-  if grep -Fxq "$bare_line" "$etc_env" 2>/dev/null; then
-    ok "HERMES_HOME already set in ${etc_env}."
-  else
-    $SUDO sed -i '/^HERMES_HOME=/d' "$etc_env"
-    printf "%s
-" "$bare_line" | $SUDO tee -a "$etc_env" >/dev/null
-    ok "Set HERMES_HOME in ${etc_env} (system-wide, for systemd and sudo)."
-  fi
-
-  # 2. AAAS_HOME/.bashrc — picked up by interactive shells.
-  #    Essential for WSL where PAM does not always load /etc/environment,
-  #    and also provides a reliable fallback on native Linux.
-  if grep -Fq "$marker" "$bashrc" 2>/dev/null; then
-    ok "HERMES_HOME already set in ${bashrc}."
-  else
-    printf "
-%s
-%s
-" "$marker" "$export_line"       | run_as_aaas tee -a "$bashrc" >/dev/null
-    ok "Set HERMES_HOME in ${bashrc} (for interactive shells and WSL)."
-  fi
-}
-
 # Install a guard wrapper at /usr/local/bin/hermes that:
 #   - Allows the command through when running as aaas (systemd, sudo -u aaas)
 #   - Blocks anyone else (e.g. bob) with a clear error and usage hint
-# This prevents non-aaas users from accidentally writing files into HERMES_HOME
-# with the wrong ownership, which would break the gateway.
-# HERMES_HOME does not need to be passed explicitly — /etc/environment provides
-# it system-wide (set by ensure_hermes_home_system_env).
+# This prevents non-aaas users from accidentally writing files into Hermes's
+# home directory with the wrong ownership, which would break the gateway.
+# No env var override is set/exported here. Hermes now installs at and reads
+# from its own default ($HOME/.hermes, i.e. AAAS_HOME/.hermes for the aaas
+# user), resolved automatically from /etc/passwd for every process (login
+# shells, sudo -u aaas, and systemd's User=aaas) — no override needed.
 HERMES_BIN=""
 HERMES_REAL_BIN=""
 ensure_hermes_wrapper() {
@@ -815,21 +798,17 @@ ensure_hermes_wrapper() {
 #!/usr/bin/env bash
 # Managed by AaaS install.sh — do not edit manually.
 # Hermes must run as the '${AAAS_USER}' service account so that all files
-# written into HERMES_HOME are owned by '${AAAS_USER}' and readable by the
-# Hermes gateway service.
+# written into its home directory are owned by '${AAAS_USER}' and readable
+# by the Hermes gateway service.
 if [[ "\$(id -un)" != "${AAAS_USER}" ]]; then
   printf "Error: hermes must be run as the '%s' user.\\n" "${AAAS_USER}" >&2
   printf "Use:   sudo -u %s hermes %s\\n" "${AAAS_USER}" '"\$@"' >&2
   exit 1
 fi
-# HERMES_HOME is forced here rather than trusted from the caller's shell
-# environment. /etc/environment + .bashrc only take effect in fresh login
-# shells; a stale terminal, a non-login shell, or a sudo invocation that
-# doesn't re-read PAM env can silently drop HERMES_HOME, causing hermes to
-# fall back to its own default of \$HOME/.hermes (e.g. /home/${AAAS_USER}/.hermes)
-# instead of ${HERMES_HOME} — this is what caused config/.env to land in the
-# wrong place. Hardcoding it here makes every invocation deterministic.
-export HERMES_HOME="${HERMES_HOME}"
+# No env var override needed: it is Hermes's own default (\$HOME/.hermes),
+# which \`id -un\`-verified '${AAAS_USER}' always resolves consistently from
+# /etc/passwd — in login shells, sudo -u ${AAAS_USER}, and systemd's
+# User=${AAAS_USER}. Nothing here can drift out of sync with that.
 exec "${real_bin}" "\$@"
 WRAPPER
     $SUDO chmod 755 "$wrapper"
@@ -843,13 +822,24 @@ WRAPPER
   fi
 }
 
-# Applies PLATFORM_DIR/hermes.config.bootstrap.yaml onto the config.yaml produced by
+# Renames a consumed bootstrap file to a timestamped backup instead of
+# deleting it outright, so there's an audit trail of what was bootstrapped
+# and when. Backups accumulate in the same PLATFORM_DIR/.hermes/ staging
+# directory as e.g. config.yaml.applied-20260712-041530.
+backup_bootstrap_file() {
+  local file="$1"
+  local backup="${file}.applied-$(date +%Y%m%d-%H%M%S)"
+  run_as_aaas mv "$file" "$backup"
+  ok "Backed up consumed bootstrap file to ${backup}."
+}
+
+# Applies PLATFORM_DIR/.hermes/config.yaml onto the config.yaml produced by
 # Hermes's own setup wizard, via a real YAML parse/merge (not text-append),
-# then deletes the bootstrap file. See platform/hermes.config.bootstrap.yaml
-# for the file format.
+# then backs up the bootstrap file with a timestamp. See
+# platform/.hermes/config.yaml for the file format.
 write_hermes_config_yaml() {
-  local hermes_config="${HERMES_HOME}/config.yaml"
-  local bootstrap_file="${PLATFORM_DIR}/hermes.config.bootstrap.yaml"
+  local hermes_config="${AAAS_HOME}/.hermes/config.yaml"
+  local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
 
   if [[ ! -f "$hermes_config" ]]; then
     warn "config.yaml not found at ${hermes_config}; skipping bootstrap merge."
@@ -857,11 +847,15 @@ write_hermes_config_yaml() {
   fi
 
   if [[ ! -f "$bootstrap_file" ]]; then
-    ok "No hermes.config.bootstrap.yaml found; leaving config.yaml as generated by Hermes."
+    ok "No .hermes/config.yaml staging file found; leaving config.yaml as generated by Hermes."
     return
   fi
 
-  BOOTSTRAP_FILE="$bootstrap_file" python3 - "$hermes_config" <<'PYEOF'
+  # Must run as aaas: hermes_config is owned aaas:aaas with mode 660/g+rX
+  # (read-only for group members). A non-aaas invoker (e.g. bob, even
+  # though he's in the aaas group) can read the file but cannot open it
+  # for writing, and the script below ends with open(path, "w").
+  run_as_aaas env BOOTSTRAP_FILE="$bootstrap_file" python3 - "$hermes_config" <<'PYEOF'
 import os, re, sys
 import yaml
 
@@ -928,11 +922,11 @@ PYEOF
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_config"
   run $SUDO chmod 660 "$hermes_config"
 
-  run rm -f "$bootstrap_file"
-  ok "Applied hermes.config.bootstrap.yaml to config.yaml and removed the bootstrap file."
+  backup_bootstrap_file "$bootstrap_file"
+  ok "Applied .hermes/config.yaml to config.yaml."
 }
 
-# hermes.config.bootstrap.yaml is a tracked file shipped in platform/ (see
+# .hermes/config.yaml is a tracked file shipped in platform/ (see
 # that file for the full format docs) and lands in PLATFORM_DIR automatically
 # via sync_platform_files — nothing here generates it. The one thing it can't
 # know ahead of time is PLATFORM_DIR itself (AAAS_ROOT is configurable), so
@@ -940,27 +934,36 @@ PYEOF
 # before write_hermes_config_yaml applies it. A no-op if the file was deleted,
 # customized to drop the placeholder, or never shipped.
 resolve_config_bootstrap_placeholders() {
-  local bootstrap_file="${PLATFORM_DIR}/hermes.config.bootstrap.yaml"
+  local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
 
   [[ -f "$bootstrap_file" ]] || return
-  grep -q '__PLATFORM_DIR__' "$bootstrap_file" || return
 
-  run_as_aaas sed -i "s|__PLATFORM_DIR__|${PLATFORM_DIR}|g" "$bootstrap_file"
-  ok "Resolved __PLATFORM_DIR__ in hermes.config.bootstrap.yaml."
+  if grep -q '__PLATFORM_DIR__' "$bootstrap_file"; then
+    run_as_aaas sed -i "s|__PLATFORM_DIR__|${PLATFORM_DIR}|g" "$bootstrap_file"
+    ok "Resolved __PLATFORM_DIR__ in .hermes/config.yaml (staging)."
+  fi
+
+  # __HERMES_HOME__ can't be known ahead of time either, since it's
+  # AAAS_HOME/.hermes and AAAS_HOME isn't resolved until ensure_aaas_user()
+  # runs at install time.
+  if grep -q '__HERMES_HOME__' "$bootstrap_file"; then
+    run_as_aaas sed -i "s|__HERMES_HOME__|${AAAS_HOME}/.hermes|g" "$bootstrap_file"
+    ok "Resolved __HERMES_HOME__ in .hermes/config.yaml (staging)."
+  fi
 }
 
-# Copies PLATFORM_DIR/hermes.soul.bootstrap.md to HERMES_HOME/SOUL.md, then
-# deletes the staging file. Unlike config.yaml, SOUL.md has no merge
-# semantics — Hermes reads it as opaque Markdown from exactly one fixed
-# path — so this is a plain copy-and-replace, not a YAML merge. If no
+# Copies PLATFORM_DIR/.hermes/SOUL.md to AAAS_HOME/.hermes/SOUL.md, then
+# backs up the staging file with a timestamp. Unlike config.yaml, SOUL.md has
+# no merge semantics — Hermes reads it as opaque Markdown from exactly one
+# fixed path — so this is a plain copy-and-replace, not a YAML merge. If no
 # staging file is present, SOUL.md is left untouched (Hermes seeds its own
 # default on first run).
 apply_hermes_soul_bootstrap() {
-  local soul_file="${HERMES_HOME}/SOUL.md"
-  local bootstrap_file="${PLATFORM_DIR}/hermes.soul.bootstrap.md"
+  local soul_file="${AAAS_HOME}/.hermes/SOUL.md"
+  local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
 
   if [[ ! -f "$bootstrap_file" ]]; then
-    ok "No hermes.soul.bootstrap.md found; leaving SOUL.md as Hermes seeds it."
+    ok "No .hermes/SOUL.md staging file found; leaving SOUL.md as Hermes seeds it."
     return
   fi
 
@@ -968,21 +971,21 @@ apply_hermes_soul_bootstrap() {
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$soul_file"
   run $SUDO chmod 660 "$soul_file"
 
-  run rm -f "$bootstrap_file"
-  ok "Applied hermes.soul.bootstrap.md to SOUL.md and removed the bootstrap file."
+  backup_bootstrap_file "$bootstrap_file"
+  ok "Applied .hermes/SOUL.md to SOUL.md."
 }
 
-# Writes a default hermes.soul.bootstrap.md if one isn't already present.
+# Writes a default .hermes/SOUL.md staging file if one isn't already present.
 # Unlike the config bootstrap, there's no historical default behavior to
 # preserve here — this just gives operators a discoverable place to drop
 # custom identity content before first install. Left commented-out/empty by
 # default so out-of-the-box behavior is unchanged (Hermes seeds its own
 # default SOUL.md when apply_hermes_soul_bootstrap finds nothing to apply).
 write_default_hermes_soul_bootstrap() {
-  local bootstrap_file="${PLATFORM_DIR}/hermes.soul.bootstrap.md"
+  local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
 
   if [[ -f "$bootstrap_file" ]]; then
-    ok "hermes.soul.bootstrap.md already present; leaving it as-is."
+    ok ".hermes/SOUL.md staging file already present; leaving it as-is."
     return
   fi
 
@@ -990,8 +993,8 @@ write_default_hermes_soul_bootstrap() {
   # SOUL.md with this content," so shipping a non-empty default here would
   # silently override Hermes's own seeded identity for every install. If
   # you want to preset a persona, create
-  # PLATFORM_DIR/hermes.soul.bootstrap.md yourself before running install.sh.
-  ok "No default hermes.soul.bootstrap.md written; create one at ${bootstrap_file} to preset SOUL.md."
+  # PLATFORM_DIR/.hermes/SOUL.md yourself before running install.sh.
+  ok "No default .hermes/SOUL.md staging file written; create one at ${bootstrap_file} to preset SOUL.md."
 }
 
 # Install Mnemosyne as Hermes's sole memory provider.
@@ -1009,8 +1012,9 @@ write_default_hermes_soul_bootstrap() {
 # The Hermes venv is built by uv with --no-pip (no pip binary in venv/bin/).
 # We bootstrap pip via ensurepip (confirmed: pip 24.0 available). Idempotent.
 #
-# MNEMOSYNE_HOME pinned inside HERMES_HOME so the SQLite DB stays within
-# the managed platform tree (default ~ resolves to AAAS_HOME, outside ROOT_DIR).
+# MNEMOSYNE_HOME pinned inside AAAS_HOME/.hermes so the SQLite DB stays
+# within the managed platform tree (default ~ resolves to AAAS_HOME, outside
+# ROOT_DIR).
 #
 # MNEMOSYNE_HOST_LLM_ENABLED=true routes consolidation through Hermes's own
 # authenticated LLM provider — no separate API key needed.
@@ -1020,14 +1024,14 @@ write_default_hermes_soul_bootstrap() {
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
 
-  local hermes_venv="${HERMES_HOME}/hermes-agent/venv"
+  local hermes_venv="${AAAS_HOME}/.hermes/hermes-agent/venv"
   local venv_python="${hermes_venv}/bin/python"
-  local mnemosyne_home="${HERMES_HOME}/mnemosyne"
+  local mnemosyne_home="${AAAS_HOME}/.hermes/mnemosyne"
 
   # ------------------------------------------------------------------
   # 1. Verify the Hermes venv exists.
   #    The bash wrapper at /usr/local/bin/hermes confirms the path:
-  #      exec "${HERMES_HOME}/hermes-agent/venv/bin/hermes" "$@"
+  #      exec "${AAAS_HOME}/.hermes/hermes-agent/venv/bin/hermes" "$@"
   # ------------------------------------------------------------------
   if [[ ! -x "$venv_python" ]]; then
     fail "Hermes venv not found at ${venv_python}. Confirm with: ls ${hermes_venv}/bin/"
@@ -1065,8 +1069,8 @@ install_mnemosyne() {
   fi
 
   # ------------------------------------------------------------------
-  # 4. Pin MNEMOSYNE_HOME inside HERMES_HOME so the SQLite database stays
-  #    in the managed platform tree.
+  # 4. Pin MNEMOSYNE_HOME inside AAAS_HOME/.hermes so the SQLite database
+  #    stays in the managed platform tree.
   # ------------------------------------------------------------------
   if grep -Fq "MNEMOSYNE_HOME" "$CONFIG_FILE" 2>/dev/null; then
     ok "MNEMOSYNE_HOME already set in ${CONFIG_FILE}."
@@ -1206,7 +1210,7 @@ configure_hermes_gateway_service_env() {
   unit_name="$($SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }')"
 
   if [[ -z "$unit_name" ]]; then
-    warn "Could not find the installed Hermes gateway systemd unit. HERMES_HOME may need a manual service override."
+    warn "Could not find the installed Hermes gateway systemd unit. It may need a manual service override."
     return
   fi
 
@@ -1214,13 +1218,14 @@ configure_hermes_gateway_service_env() {
   dropin_file="${dropin_dir}/aaas.conf"
 
   run $SUDO mkdir -p "$dropin_dir"
-  # Run the gateway as aaas:aaas and supply HERMES_HOME so the process finds
-  # its config without needing environment variables set by the calling shell.
+  # Run the gateway as aaas:aaas. With User=aaas set, systemd resolves $HOME
+  # from /etc/passwd automatically, so Hermes finds its config at its own
+  # default location without any extra environment variables.
   printf "[Service]\nUser=%s\nGroup=%s\nEnvironmentFile=%s\n" \
     "$AAAS_USER" "$AAAS_GROUP" "$CONFIG_FILE" \
     | $SUDO tee "$dropin_file" >/dev/null
   run $SUDO systemctl daemon-reload
-  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} and ${HERMES_HOME}."
+  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} and ${AAAS_HOME}/.hermes."
 }
 
 verify_hermes_runtime() {
@@ -1238,10 +1243,10 @@ verify_hermes_runtime() {
     || fail "Hermes gateway command is unavailable. Reinstall Hermes Agent, then rerun install.sh."
   ok "Hermes gateway command is available."
 
-  if [[ -f "${HERMES_HOME}/config.yaml" ]]; then
-    ok "Hermes config.yaml is present at ${HERMES_HOME}."
+  if [[ -f "${AAAS_HOME}/.hermes/config.yaml" ]]; then
+    ok "Hermes config.yaml is present at ${AAAS_HOME}/.hermes."
   else
-    warn "Hermes config.yaml not found yet at ${HERMES_HOME}/config.yaml — expected, since --skip-setup was used."
+    warn "Hermes config.yaml not found yet at ${AAAS_HOME}/.hermes/config.yaml — expected, since --skip-setup was used."
     warn "It will be created on first run: sudo -u ${AAAS_USER} hermes doctor"
   fi
 
@@ -1303,8 +1308,8 @@ install_watchdog_service() {
 summary() {
   printf "\n%s%sInstallation complete.%s\n" "${GREEN}${BOLD}" "✨ " "${RESET}"
   printf "%sService account:%s %s:%s (home: %s)\n" "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP" "$AAAS_HOME"
-  printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "$HERMES_HOME"
-  printf "%sMemory:%s         Mnemosyne → %s/mnemosyne/data/mnemosyne.db\n" "${BOLD}" "${RESET}" "$HERMES_HOME"
+  printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "${AAAS_HOME}/.hermes"
+  printf "%sMemory:%s         Mnemosyne → %s/mnemosyne/data/mnemosyne.db\n" "${BOLD}" "${RESET}" "${AAAS_HOME}/.hermes"
   printf "%sConfig:%s         %s\n"        "${BOLD}" "${RESET}" "$CONFIG_FILE"
   printf "%sWatchdog:%s       %s\n"        "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
   if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
@@ -1351,7 +1356,8 @@ main() {
   ensure_aaas_user          # must come before ensure_owned_dir calls
   ensure_owned_dir "$ROOT_DIR"
   ensure_owned_dir "$PLATFORM_DIR"
-  ensure_owned_dir "$HERMES_HOME"
+  ensure_owned_dir "${AAAS_HOME}/.hermes"
+  ensure_owned_dir "${AAAS_HOME}/.hermes/skills"
   ensure_owned_dir "$WATCHDOG_DIR"
   ensure_aaas_profile         # must run before install_hermes
   sync_platform_files
