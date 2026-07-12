@@ -11,13 +11,12 @@
 # The paths below use two placeholders, substituted by install.sh after this
 # file is synced onto the target host — neither can be known ahead of time:
 #   __PLATFORM_DIR__  →  ${AAAS_ROOT}/platform (AAAS_ROOT is configurable)
-#   __HERMES_HOME__   →  AAAS_HOME/.hermes, resolved from /etc/passwd for
-#                         the aaas service account at install time
+
 
 skills:
   external_dirs:
     - __PLATFORM_DIR__/.opencode/skills
-    - __HERMES_HOME__/skills
+    - __PLATFORM_DIR__/.hermes/skills
 
 # Mnemosyne is the sole memory provider. memory_enabled and user_profile_enabled
 # are set to false to suppress MEMORY.md and USER.md from the system prompt —
@@ -27,11 +26,12 @@ skills:
 # `hermes tools enable/disable memory` — NOT by this config key.
 # Do NOT run `hermes tools disable memory` — that kills Mnemosyne tools too.
 memory:
-  memory_enabled: false
-  user_profile_enabled: false
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 200
+  user_char_limit: 200
   provider: mnemosyne
-  mnemosyne:
-    profile_isolation: false
+
 
 # Left for `hermes setup` to configure interactively.
 #provider:
