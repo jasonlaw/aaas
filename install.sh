@@ -81,7 +81,8 @@ trap 'fail "Installation stopped near line ${LINENO}."' ERR
 #
 # If the current user IS aaas (LOGIN_USER == AAAS_USER, or EUID matches),
 # the command runs directly — no sudo needed (WSL scenario where aaas is
-# the primary login user, or any case where the installer runs as aaas).  Otherwise it delegates via `sudo -u aaas`.
+# the primary login user, or any case where the installer runs as aaas).
+# Otherwise it delegates via `sudo -u aaas`.
 # ---------------------------------------------------------------------------
 run_as_aaas() {
   if [[ "$(id -un)" == "$AAAS_USER" ]]; then
@@ -371,7 +372,7 @@ ensure_aaas_user() {
       --no-create-home \
       --shell "$AAAS_SHELL" \
       "$AAAS_USER"
-    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."  # AAAS_HOME resolved below
+    ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."
   else
     ok "User ${AAAS_USER} already exists."
     # Only ever UPGRADE the shell (nologin -> bash), and only when we are
@@ -429,7 +430,8 @@ ensure_aaas_profile() {
 
   # Append the sourcing block. Using run_as_aaas tee -a avoids quoting
   # issues with heredocs passed through sudo.
-  printf '\n%s\n%s\n' "$marker" '[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"'     | run_as_aaas tee -a "$profile" >/dev/null
+  printf '\n%s\n%s\n' "$marker" '[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"' \
+    | run_as_aaas tee -a "$profile" >/dev/null
   ok "Updated ${profile} to source .bashrc for login shells."
 }
 
@@ -458,11 +460,6 @@ sync_platform_files() {
   ensure_owned_dir "$PLATFORM_DIR"
 
   if have tar; then
-    # PLATFORM_DIR/.hermes is a staging directory for one-shot bootstrap
-    # files only (config.yaml, SOUL.md) — it is NOT Hermes's own home
-    # directory (that lives at AAAS_HOME/.hermes, per README's "Design"
-    # section). Nothing under PLATFORM_DIR/.hermes holds real secrets, so
-    # no excludes are needed here.
     tar \
       -C "$source_platform" -cf - . | run_as_aaas tar -C "$PLATFORM_DIR" -xf -
   else
@@ -600,8 +597,7 @@ ensure_opencode() {
 
 # PyYAML is required to merge .hermes/config.yaml (staging) into whatever
 # config.yaml the Hermes setup wizard produces, without clobbering other
-# top-level keys (e.g. the wizard's own `skills.creation_nudge_interval`) or
-# introducing duplicate YAML keys.
+# top-level keys or introducing duplicate YAML keys.
 ensure_python_yaml() {
   step "Checking for PyYAML"
 
@@ -712,13 +708,8 @@ ensure_docker() {
 
 # Hermes is installed as the aaas user so that:
 #   - All files under Hermes's home (AAAS_HOME/.hermes) are owned by aaas
-#     from birth
-#   - The binary lands in aaas's local path (e.g. /opt/aaas/.local/bin/hermes)
-#   - Anyone wanting to run `hermes` must do so as aaas (via run_as_aaas /
-#     sudo -u aaas), which naturally prevents bob from accidentally writing
-#     root-owned or bob-owned files into Hermes's home directory
-# ensure_hermes_wrapper installs a guard at /usr/local/bin/hermes that blocks
-# non-aaas users and passes through to the real binary for the aaas user.
+#   - The binary lands in aaas's local path
+#   - Anyone wanting to run `hermes` must do so as aaas
 install_hermes() {
   step "Installing Hermes"
 
@@ -729,15 +720,6 @@ install_hermes() {
     ok "Hermes is already available."
   else
     install_banner "Hermes"
-    # Install as aaas: the OS sets HOME automatically from /etc/passwd, so
-    # hermes lands at its own default (${AAAS_HOME}/.hermes) with no need to
-    # override it via an env var. An explicit override was tried previously
-    # and proved unreliable: it only takes effect in whichever shell/service
-    # actually has it in scope, and stale terminals, non-login shells, and
-    # sudo invocations that don't re-read PAM env silently fell back to
-    # Hermes's real default anyway, producing config/.env in a different
-    # place than intended. Letting Hermes use its own default removes that
-    # whole class of drift.
     curl -fsSL "$install_url" | run_as_aaas \
       bash -s -- --skip-setup --non-interactive --skip-browser
     ok "Hermes installer finished."
@@ -775,14 +757,8 @@ EOF
 }
 
 # Install a guard wrapper at /usr/local/bin/hermes that:
-#   - Allows the command through when running as aaas (systemd, sudo -u aaas)
-#   - Blocks anyone else (e.g. bob) with a clear error and usage hint
-# This prevents non-aaas users from accidentally writing files into Hermes's
-# home directory with the wrong ownership, which would break the gateway.
-# No env var override is set/exported here. Hermes now installs at and reads
-# from its own default ($HOME/.hermes, i.e. AAAS_HOME/.hermes for the aaas
-# user), resolved automatically from /etc/passwd for every process (login
-# shells, sudo -u aaas, and systemd's User=aaas) — no override needed.
+#   - Allows the command through when running as aaas
+#   - Blocks anyone else with a clear error and usage hint
 HERMES_BIN=""
 HERMES_REAL_BIN=""
 ensure_hermes_wrapper() {
@@ -797,18 +773,11 @@ ensure_hermes_wrapper() {
     $SUDO tee "$wrapper" >/dev/null <<WRAPPER
 #!/usr/bin/env bash
 # Managed by AaaS install.sh — do not edit manually.
-# Hermes must run as the '${AAAS_USER}' service account so that all files
-# written into its home directory are owned by '${AAAS_USER}' and readable
-# by the Hermes gateway service.
 if [[ "\$(id -un)" != "${AAAS_USER}" ]]; then
   printf "Error: hermes must be run as the '%s' user.\\n" "${AAAS_USER}" >&2
   printf "Use:   sudo -u %s hermes %s\\n" "${AAAS_USER}" '"\$@"' >&2
   exit 1
 fi
-# No env var override needed: it is Hermes's own default (\$HOME/.hermes),
-# which \`id -un\`-verified '${AAAS_USER}' always resolves consistently from
-# /etc/passwd — in login shells, sudo -u ${AAAS_USER}, and systemd's
-# User=${AAAS_USER}. Nothing here can drift out of sync with that.
 exec "${real_bin}" "\$@"
 WRAPPER
     $SUDO chmod 755 "$wrapper"
@@ -822,10 +791,7 @@ WRAPPER
   fi
 }
 
-# Renames a consumed bootstrap file to a timestamped backup instead of
-# deleting it outright, so there's an audit trail of what was bootstrapped
-# and when. Backups accumulate in the same PLATFORM_DIR/.hermes/ staging
-# directory as e.g. config.yaml.applied-20260712-041530.
+# Renames a consumed bootstrap file to a timestamped backup.
 backup_bootstrap_file() {
   local file="$1"
   local backup="${file}.applied-$(date +%Y%m%d-%H%M%S)"
@@ -834,9 +800,7 @@ backup_bootstrap_file() {
 }
 
 # Applies PLATFORM_DIR/.hermes/config.yaml onto the config.yaml produced by
-# Hermes's own setup wizard, via a real YAML parse/merge (not text-append),
-# then backs up the bootstrap file with a timestamp. See
-# platform/.hermes/config.yaml for the file format.
+# Hermes's own setup wizard, via a real YAML parse/merge (not text-append).
 write_hermes_config_yaml() {
   local hermes_config="${AAAS_HOME}/.hermes/config.yaml"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
@@ -851,10 +815,6 @@ write_hermes_config_yaml() {
     return
   fi
 
-  # Must run as aaas: hermes_config is owned aaas:aaas with mode 660/g+rX
-  # (read-only for group members). A non-aaas invoker (e.g. bob, even
-  # though he's in the aaas group) can read the file but cannot open it
-  # for writing, and the script below ends with open(path, "w").
   run_as_aaas env BOOTSTRAP_FILE="$bootstrap_file" python3 - "$hermes_config" <<'PYEOF'
 import os, re, sys
 import yaml
@@ -868,12 +828,6 @@ with open(path) as f:
 with open(bootstrap_path) as f:
     bootstrap_text = f.read()
 
-# Top-level keys that are entirely commented out in the bootstrap file (e.g.
-# `#provider:` or `# provider:`) are the "comment this section out in
-# config.yaml" signal. Only a single optional space between "#" and the key
-# is treated as top-level; more indentation (e.g. "#  token: x", a commented
-# sub-key inside a commented block) is ignored so it can't be mistaken for
-# an unrelated top-level key of the same name elsewhere in config.yaml.
 commented_keys = set(re.findall(r'^#[ ]?([A-Za-z0-9_.-]+):', bootstrap_text, re.MULTILINE))
 
 bootstrap = yaml.safe_load(bootstrap_text) or {}
@@ -891,8 +845,6 @@ deep_merge(cfg, bootstrap)
 dumped = yaml.dump(cfg, default_flow_style=False, sort_keys=False)
 
 def comment_out_block(text, key):
-    """Comment out a top-level `key:` line plus any indented/blank lines
-    that belong to it, stopping at the next top-level key or EOF."""
     out = []
     in_block = False
     for line in text.splitlines(keepends=True):
@@ -926,13 +878,8 @@ PYEOF
   ok "Applied .hermes/config.yaml to config.yaml."
 }
 
-# .hermes/config.yaml is a tracked file shipped in platform/ (see
-# that file for the full format docs) and lands in PLATFORM_DIR automatically
-# via sync_platform_files — nothing here generates it. The one thing it can't
-# know ahead of time is PLATFORM_DIR itself (AAAS_ROOT is configurable), so
-# this just resolves the __PLATFORM_DIR__ placeholder in the synced copy
-# before write_hermes_config_yaml applies it. A no-op if the file was deleted,
-# customized to drop the placeholder, or never shipped.
+# Resolves __PLATFORM_DIR__ and __HERMES_HOME__ placeholders in the
+# bootstrap config.yaml before write_hermes_config_yaml applies it.
 resolve_config_bootstrap_placeholders() {
   local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
 
@@ -943,21 +890,13 @@ resolve_config_bootstrap_placeholders() {
     ok "Resolved __PLATFORM_DIR__ in .hermes/config.yaml (staging)."
   fi
 
-  # __HERMES_HOME__ can't be known ahead of time either, since it's
-  # AAAS_HOME/.hermes and AAAS_HOME isn't resolved until ensure_aaas_user()
-  # runs at install time.
   if grep -q '__HERMES_HOME__' "$bootstrap_file"; then
     run_as_aaas sed -i "s|__HERMES_HOME__|${AAAS_HOME}/.hermes|g" "$bootstrap_file"
     ok "Resolved __HERMES_HOME__ in .hermes/config.yaml (staging)."
   fi
 }
 
-# Copies PLATFORM_DIR/.hermes/SOUL.md to AAAS_HOME/.hermes/SOUL.md, then
-# backs up the staging file with a timestamp. Unlike config.yaml, SOUL.md has
-# no merge semantics — Hermes reads it as opaque Markdown from exactly one
-# fixed path — so this is a plain copy-and-replace, not a YAML merge. If no
-# staging file is present, SOUL.md is left untouched (Hermes seeds its own
-# default on first run).
+# Copies PLATFORM_DIR/.hermes/SOUL.md to AAAS_HOME/.hermes/SOUL.md.
 apply_hermes_soul_bootstrap() {
   local soul_file="${AAAS_HOME}/.hermes/SOUL.md"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
@@ -975,12 +914,6 @@ apply_hermes_soul_bootstrap() {
   ok "Applied .hermes/SOUL.md to SOUL.md."
 }
 
-# Writes a default .hermes/SOUL.md staging file if one isn't already present.
-# Unlike the config bootstrap, there's no historical default behavior to
-# preserve here — this just gives operators a discoverable place to drop
-# custom identity content before first install. Left commented-out/empty by
-# default so out-of-the-box behavior is unchanged (Hermes seeds its own
-# default SOUL.md when apply_hermes_soul_bootstrap finds nothing to apply).
 write_default_hermes_soul_bootstrap() {
   local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
 
@@ -989,49 +922,57 @@ write_default_hermes_soul_bootstrap() {
     return
   fi
 
-  # No file is written by default: presence of this file means "overwrite
-  # SOUL.md with this content," so shipping a non-empty default here would
-  # silently override Hermes's own seeded identity for every install. If
-  # you want to preset a persona, create
-  # PLATFORM_DIR/.hermes/SOUL.md yourself before running install.sh.
   ok "No default .hermes/SOUL.md staging file written; create one at ${bootstrap_file} to preset SOUL.md."
 }
 
+# ---------------------------------------------------------------------------
 # Install Mnemosyne as Hermes's sole memory provider.
 #
-# Official method (docs.mnemosyne.site/integration/hermes):
-#   pip install mnemosyne-memory[embeddings]  — inside the Hermes venv
-#   (not [all]: MNEMOSYNE_HOST_LLM_ENABLED=true below routes consolidation
-#   through Hermes's own model, so the local LLM backend in [all] is
-#   unneeded weight — [embeddings] alone covers vector/hybrid recall)
-#   config.yaml: provider: mnemosyne  — already handled by bootstrap
+# Canonical method per https://github.com/mnemosyne-oss/mnemosyne:
 #
-# No symlink step, no `hermes config set` — Mnemosyne registers itself
-# via Python entry points once installed in the same venv Hermes uses.
+#   pip install mnemosyne-hermes        — plugin wrapper + entry points
+#                                         (always required for Hermes)
+#   + one of:
+#   pip install mnemosyne-memory        — core only, ~50 MB RAM
+#                                         no local embeddings; point
+#                                         MNEMOSYNE_EMBEDDING_API_URL externally
+#   pip install mnemosyne-memory[embeddings]  — adds fastembed, ~800 MB RAM
+#   pip install mnemosyne-memory[all]   — full local LLM + embeddings, ~1.5 GB
 #
-# The Hermes venv is built by uv with --no-pip (no pip binary in venv/bin/).
-# We bootstrap pip via ensurepip (confirmed: pip 24.0 available). Idempotent.
+#   hermes config set memory.provider mnemosyne
+#   hermes memory setup                 — activates the provider
 #
-# MNEMOSYNE_HOME pinned inside AAAS_HOME/.hermes so the SQLite DB stays
-# within the managed platform tree (default ~ resolves to AAAS_HOME, outside
-# ROOT_DIR).
+# The platform/.hermes/config.yaml bootstrap must set:
+#   memory:
+#     memory_enabled: false        — disables built-in MEMORY.md injection
+#     user_profile_enabled: false  — disables built-in USER.md injection
+#     provider: mnemosyne
 #
-# MNEMOSYNE_HOST_LLM_ENABLED=true routes consolidation through Hermes's own
-# authenticated LLM provider — no separate API key needed.
+# IMPORTANT: do NOT use `hermes tools disable memory` — that also kills all
+# 23 Mnemosyne-registered tools. Use memory_enabled: false in config.yaml.
 #
-# NOTE on SOUL.md: loaded directly into the system prompt by Hermes at session
-# start. Explicitly excluded from memory capture. Never seeded into Mnemosyne.
+# MNEMOSYNE_HOST_LLM_ENABLED routes consolidation LLM calls through Hermes's
+# own authenticated provider — no separate API key needed.
+# This env var belongs in ~/.hermes/.env (read by Hermes at startup), NOT
+# in the AaaS platform .env (only read by watchdog/opencode).
+#
+# Data lives at ~/.hermes/mnemosyne/data/ (upstream default).
+#
+# Install profile is controlled by MNEMOSYNE_INSTALL_PROFILE env var:
+#   unset / ""   → mnemosyne-memory (core, default, ~50 MB)
+#   "embeddings" → mnemosyne-memory[embeddings] (~800 MB, needs 2 GB free RAM)
+#   "all"        → mnemosyne-memory[all] (~1.5 GB, needs 8 GB+ free RAM)
+# ---------------------------------------------------------------------------
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
 
   local hermes_venv="${AAAS_HOME}/.hermes/hermes-agent/venv"
   local venv_python="${hermes_venv}/bin/python"
-  local mnemosyne_home="${AAAS_HOME}/.hermes/mnemosyne"
+  local hermes_env="${AAAS_HOME}/.hermes/.env"
+  local profile="${MNEMOSYNE_INSTALL_PROFILE:-}"
 
   # ------------------------------------------------------------------
   # 1. Verify the Hermes venv exists.
-  #    The bash wrapper at /usr/local/bin/hermes confirms the path:
-  #      exec "${AAAS_HOME}/.hermes/hermes-agent/venv/bin/hermes" "$@"
   # ------------------------------------------------------------------
   if [[ ! -x "$venv_python" ]]; then
     fail "Hermes venv not found at ${venv_python}. Confirm with: ls ${hermes_venv}/bin/"
@@ -1039,56 +980,102 @@ install_mnemosyne() {
   ok "Hermes venv found at ${hermes_venv}."
 
   # ------------------------------------------------------------------
-  # 2. Bootstrap pip into the venv.
-  #    Hermes venv is built by uv with --no-pip — no pip binary exists.
-  #    ensurepip installs pip 24.0 (confirmed available on this system).
-  #    --upgrade is a no-op when pip is already present — idempotent.
+  # 2. Bootstrap pip — Hermes venv is built by uv with --no-pip.
+  #    ensurepip is idempotent; --upgrade is a no-op if pip is current.
   # ------------------------------------------------------------------
   run_as_aaas "$venv_python" -m ensurepip --upgrade
 
   # ------------------------------------------------------------------
-  # 3. Install mnemosyne-memory[embeddings] into the Hermes venv.
-  #    [embeddings] pulls in fastembed for local vector search.
-  #    We deliberately skip [all]: it also bundles sentence-transformers
-  #    + ctransformers (a local GGUF LLM runtime) for consolidation,
-  #    which is unnecessary here because MNEMOSYNE_HOST_LLM_ENABLED=true
-  #    (set below) routes consolidation/fact-extraction LLM calls through
-  #    Hermes's own authenticated provider instead. [embeddings] needs
-  #    ~2 GB free RAM vs. ~8 GB+ recommended for [all].
-  #    Mnemosyne registers itself as a provider via Python entry points —
-  #    no symlink or plugin directory step required.
+  # 3. Install the core library with the chosen profile, plus the
+  #    mnemosyne-hermes plugin wrapper (always required for Hermes).
+  #
+  #    mnemosyne-hermes wraps mnemosyne-memory with the plugin manifest
+  #    and entry points that Hermes's plugin system discovers. Both
+  #    packages must be present; installing mnemosyne-memory alone is
+  #    not sufficient for Hermes to recognise the provider.
   # ------------------------------------------------------------------
-  if run_as_aaas "$venv_python" -c "import mnemosyne" >/dev/null 2>&1; then
-    local installed_ver
-    installed_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
-    ok "mnemosyne-memory ${installed_ver} already installed in Hermes venv."
+  local core_pkg
+  if [[ -n "$profile" ]]; then
+    core_pkg="mnemosyne-memory[${profile}]"
   else
-    install_banner "mnemosyne-memory"
-    run_as_aaas "$venv_python" -m pip install --quiet --upgrade "mnemosyne-memory[embeddings]"
-    ok "mnemosyne-memory installed in Hermes venv."
+    core_pkg="mnemosyne-memory"
+  fi
+
+  local installed_core_ver installed_hermes_ver
+  installed_core_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
+  installed_hermes_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-hermes 2>/dev/null | awk '/^Version:/ {print $2}')"
+
+  if [[ -n "$installed_core_ver" && -n "$installed_hermes_ver" ]]; then
+    ok "mnemosyne-memory ${installed_core_ver} and mnemosyne-hermes ${installed_hermes_ver} already installed; skipping."
+  else
+    install_banner "mnemosyne (${core_pkg} + mnemosyne-hermes)"
+    run_as_aaas "$venv_python" -m pip install --quiet --upgrade "$core_pkg" mnemosyne-hermes
+    ok "Installed ${core_pkg} and mnemosyne-hermes in Hermes venv."
   fi
 
   # ------------------------------------------------------------------
-  # 4. Pin MNEMOSYNE_HOME inside AAAS_HOME/.hermes so the SQLite database
-  #    stays in the managed platform tree.
+  # 4. Register mnemosyne as the active memory provider.
+  #    `hermes config set` writes memory.provider: mnemosyne into
+  #    ~/.hermes/config.yaml without requiring an interactive session.
   # ------------------------------------------------------------------
-  if grep -Fq "MNEMOSYNE_HOME" "$CONFIG_FILE" 2>/dev/null; then
-    ok "MNEMOSYNE_HOME already set in ${CONFIG_FILE}."
+  run_as_aaas bash -li -c "hermes config set memory.provider mnemosyne"
+  ok "memory.provider set to mnemosyne in Hermes config."
+
+  # ------------------------------------------------------------------
+  # 5. Activate the provider — idempotent guard first.
+  #    `hermes memory setup` is not documented as idempotent: on a
+  #    second run it may prompt, error, or attempt to reinitialise an
+  #    already-active provider, which could trip set -e.
+  #
+  #    Guard: skip setup entirely if BOTH conditions are true:
+  #      a) the plugin directory already exists (setup ran before), AND
+  #      b) config already names mnemosyne as the provider.
+  #    If either is missing, run setup. The warn path is a soft
+  #    fallback for TTY-only environments; it does not abort the install.
+  # ------------------------------------------------------------------
+  local plugins_dir="${AAAS_HOME}/.hermes/plugins/mnemosyne"
+  local current_provider
+  current_provider="$(run_as_aaas bash -li -c \
+    "hermes config get memory.provider 2>/dev/null || true")"
+
+  if [[ -d "$plugins_dir" && "$current_provider" == "mnemosyne" ]]; then
+    ok "Mnemosyne provider already active (plugin dir exists, provider confirmed); skipping hermes memory setup."
+  elif run_as_aaas bash -li -c \
+    "hermes memory setup --provider mnemosyne --non-interactive" 2>/dev/null; then
+    ok "Mnemosyne provider activated via hermes memory setup."
   else
-    printf "MNEMOSYNE_HOME=%s\n" "$mnemosyne_home" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
-    ok "MNEMOSYNE_HOME=${mnemosyne_home} written to ${CONFIG_FILE}."
+    warn "hermes memory setup could not run non-interactively (may need a TTY)."
+    warn "Run manually after install: sudo -u ${AAAS_USER} hermes memory setup"
+    warn "Select 'mnemosyne' from the picker when prompted."
   fi
 
   # ------------------------------------------------------------------
-  # 5. Route Mnemosyne's LLM consolidation calls through Hermes's own
-  #    authenticated provider — no separate API key or cloud service needed.
+  # 6. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
+  #    This routes Mnemosyne's consolidation and fact-extraction LLM
+  #    calls through Hermes's own authenticated provider, so no
+  #    separate API key is needed for memory operations.
+  #
+  #    ~/.hermes/.env is the correct location — Hermes reads it at
+  #    startup. The AaaS platform .env (CONFIG_FILE) is only consumed
+  #    by the watchdog and opencode, not by Hermes itself.
   # ------------------------------------------------------------------
-  if grep -Fq "MNEMOSYNE_HOST_LLM_ENABLED" "$CONFIG_FILE" 2>/dev/null; then
-    ok "MNEMOSYNE_HOST_LLM_ENABLED already set in ${CONFIG_FILE}."
+  if grep -Fq "MNEMOSYNE_HOST_LLM_ENABLED" "$hermes_env" 2>/dev/null; then
+    ok "MNEMOSYNE_HOST_LLM_ENABLED already set in ${hermes_env}."
   else
-    printf "MNEMOSYNE_HOST_LLM_ENABLED=true\n" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
-    ok "MNEMOSYNE_HOST_LLM_ENABLED=true written to ${CONFIG_FILE}."
+    printf "MNEMOSYNE_HOST_LLM_ENABLED=true\n" | run_as_aaas tee -a "$hermes_env" >/dev/null
+    ok "MNEMOSYNE_HOST_LLM_ENABLED=true written to ${hermes_env}."
   fi
+
+  # Re-lock ownership/permissions on .env after writing.
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_env"
+  run $SUDO chmod 660 "$hermes_env"
+
+  ok "Mnemosyne install complete."
+  ok "Data will live at ${AAAS_HOME}/.hermes/mnemosyne/data/"
+  warn "After gateway restart, verify with:"
+  warn "  sudo -u ${AAAS_USER} hermes memory status"
+  warn "  sudo -u ${AAAS_USER} hermes tools list | grep mnemosyne"
+  warn "  sudo -u ${AAAS_USER} hermes doctor | grep -A5 'Memory Provider'"
 }
 
 write_watchdog() {
@@ -1225,7 +1212,7 @@ configure_hermes_gateway_service_env() {
     "$AAAS_USER" "$AAAS_GROUP" "$CONFIG_FILE" \
     | $SUDO tee "$dropin_file" >/dev/null
   run $SUDO systemctl daemon-reload
-  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} and ${AAAS_HOME}/.hermes."
+  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP}."
 }
 
 verify_hermes_runtime() {
@@ -1235,8 +1222,6 @@ verify_hermes_runtime() {
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
-  # Verify hermes is reachable as the aaas user (it is installed under aaas's
-  # local path; /usr/local/bin/hermes symlink makes it visible system-wide).
   run_as_aaas bash -li -c "command -v hermes >/dev/null 2>&1" \
     || fail "hermes is not on PATH for ${AAAS_USER}. Fix Hermes install, then rerun install.sh."
   run_as_aaas bash -li -c "hermes --help 2>/dev/null" | grep -qi gateway \
@@ -1309,7 +1294,7 @@ summary() {
   printf "\n%s%sInstallation complete.%s\n" "${GREEN}${BOLD}" "✨ " "${RESET}"
   printf "%sService account:%s %s:%s (home: %s)\n" "${BOLD}" "${RESET}" "$AAAS_USER" "$AAAS_GROUP" "$AAAS_HOME"
   printf "%sHermes home:%s    %s\n"        "${BOLD}" "${RESET}" "${AAAS_HOME}/.hermes"
-  printf "%sMemory:%s         Mnemosyne → %s/mnemosyne/data/mnemosyne.db\n" "${BOLD}" "${RESET}" "${AAAS_HOME}/.hermes"
+  printf "%sMemory:%s         Mnemosyne → %s/.hermes/mnemosyne/data/mnemosyne.db\n" "${BOLD}" "${RESET}" "${AAAS_HOME}"
   printf "%sConfig:%s         %s\n"        "${BOLD}" "${RESET}" "$CONFIG_FILE"
   printf "%sWatchdog:%s       %s\n"        "${BOLD}" "${RESET}" "${WATCHDOG_DIR}/watchdog.sh"
   if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
@@ -1326,22 +1311,27 @@ summary() {
   fi
   printf "\n%sNext steps:%s\n" "${BOLD}" "${RESET}"
   printf "  1. Complete provider and model configuration:\n"
-  printf "       ${BOLD}hermes setup${RESET}\n"
+  printf "       ${BOLD}sudo -u %s hermes setup${RESET}\n" "$AAAS_USER"
   printf "     Follow the interactive wizard to set your API keys and preferred model.\n"
   printf "     Mnemosyne will route its consolidation calls through that same provider.\n"
   printf "\n"
   printf "  2. Verify Mnemosyne is active:\n"
-  printf "       ${BOLD}sudo -u %s hermes doctor | grep -i memory${RESET}\n" "$AAAS_USER"
-  printf "       ${BOLD}sudo -u %s hermes tools list | grep -i mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes memory status${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes tools list | grep mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes doctor | grep -A5 'Memory Provider'${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  3. (Optional) Add a fallback provider for reliability:\n"
-  printf "       ${BOLD}hermes fallback add${RESET}\n"
+  printf "       ${BOLD}sudo -u %s hermes fallback add${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  4. (Optional) Configure messaging platform integrations (Telegram, etc.):\n"
-  printf "       ${BOLD}hermes gateway setup${RESET}\n"
+  printf "       ${BOLD}sudo -u %s hermes gateway setup${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  5. After any configuration change, restart the gateway to apply it:\n"
   printf "       ${BOLD}sudo systemctl restart hermes-gateway${RESET}\n"
+  printf "\n"
+  printf "  6. (Optional) Use local embeddings for better memory recall:\n"
+  printf "       Set MNEMOSYNE_INSTALL_PROFILE=embeddings and rerun install.sh\n"
+  printf "       Requires ~800 MB RAM. For full local LLM use 'all' (~1.5 GB, 8 GB+ RAM).\n"
   printf "\n"
   printf "%sHermes gateway note:%s\n" "${BOLD}" "${RESET}"
   printf "  The gateway is installed as a systemd system service, which means it\n"
