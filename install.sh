@@ -1002,8 +1002,10 @@ install_mnemosyne() {
   fi
 
   local installed_core_ver installed_hermes_ver
-  installed_core_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}')"
-  installed_hermes_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-hermes 2>/dev/null | awk '/^Version:/ {print $2}')"
+  # `pip show` exits non-zero when the package is absent; || true prevents
+  # that from tripping set -e before we even reach the install step.
+  installed_core_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
+  installed_hermes_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-hermes 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
 
   if [[ -n "$installed_core_ver" && -n "$installed_hermes_ver" ]]; then
     ok "mnemosyne-memory ${installed_core_ver} and mnemosyne-hermes ${installed_hermes_ver} already installed; skipping."
