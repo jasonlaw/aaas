@@ -1013,8 +1013,8 @@ write_default_hermes_soul_bootstrap() {
 # ---------------------------------------------------------------------------
 ensure_venv_ensurepip_support() {
   local probe_dir
-  probe_dir="$(mktemp -d)"
 
+  probe_dir="$(mktemp -d)"
   if python3 -m venv "${probe_dir}/probe" >/dev/null 2>&1 \
      && [[ -x "${probe_dir}/probe/bin/pip" || -x "${probe_dir}/probe/bin/pip3" ]]; then
     rm -rf "$probe_dir"
@@ -1061,10 +1061,73 @@ ensure_venv_ensurepip_support() {
 }
 
 # ---------------------------------------------------------------------------
+# resolve_hermes_python — find the actual python interpreter Hermes runs on.
+#
+# HERMES_REAL_BIN often is NOT a python interpreter directly — it may be a
+# thin bash wrapper that `exec`s into a venv's own entrypoint script, e.g.:
+#
+#   #!/usr/bin/env bash
+#   unset PYTHONPATH
+#   unset PYTHONHOME
+#   exec "/home/aaas/.hermes/hermes-agent/venv/bin/hermes" "$@"
+#
+# In that case the real interpreter is python3 sitting in the SAME venv
+# bin/ directory as whatever the wrapper execs into — not something named
+# literally "python" in the wrapper text itself.
+#
+# Resolution order:
+#   1. If HERMES_REAL_BIN's own shebang already names a python interpreter,
+#      use that directly.
+#   2. Otherwise, grep the wrapper for an `exec ".../bin/<name>"` line and
+#      derive python3 from that same bin/ directory.
+#   3. Fall back to introspecting a live hermes process via /proc.
+# ---------------------------------------------------------------------------
+resolve_hermes_python() {
+  local shebang candidate venv_bin_dir
+
+  shebang="$(run_as_aaas head -n1 "$HERMES_REAL_BIN" 2>/dev/null | sed -n 's/^#!//p')"
+
+  # Case 1: shebang already IS a python interpreter.
+  if [[ "$shebang" == *python* ]] && run_as_aaas test -x "$shebang"; then
+    printf '%s' "$shebang"
+    return 0
+  fi
+
+  # Case 2: wrapper script `exec`s into another binary inside a venv's
+  # bin/ directory (e.g. `exec ".../hermes-agent/venv/bin/hermes" "$@"`).
+  # Derive python3 from that same bin/ directory.
+  if run_as_aaas test -r "$HERMES_REAL_BIN"; then
+    candidate="$(run_as_aaas grep -oE 'exec[[:space:]]+"?(/[^"'"'"' ]+/bin/[A-Za-z0-9_.-]+)"?' "$HERMES_REAL_BIN" 2>/dev/null \
+      | grep -oE '/[^"'"'"' ]+/bin/[A-Za-z0-9_.-]+' | head -n1)"
+    if [[ -n "$candidate" ]]; then
+      venv_bin_dir="$(dirname "$candidate")"
+      if run_as_aaas test -x "${venv_bin_dir}/python3"; then
+        printf '%s' "${venv_bin_dir}/python3"
+        return 0
+      elif run_as_aaas test -x "${venv_bin_dir}/python"; then
+        printf '%s' "${venv_bin_dir}/python"
+        return 0
+      fi
+    fi
+  fi
+
+  # Case 3: fall back to asking a live hermes gateway process directly via
+  # /proc, in case the launcher's structure is too dynamic to grep reliably.
+  candidate="$(pgrep -af 'hermes' 2>/dev/null | grep -oE '/[^ ]+/bin/python[0-9.]*' | head -n1 || true)"
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # bootstrap_mnemosyne_into_hermes_venv — install mnemosyne-hermes into
 # Hermes's own uv-managed venv, the way its externally-managed-environment
 # error itself instructs: via `uv pip install --python <hermes-python>
-# --break-system-packages`, not a plain pip install.
+# --break-system-packages`, not a plain pip install (which fails there
+# under PEP 668).
 #
 # Idempotent: skips entirely if the import already succeeds from Hermes's
 # python interpreter.
@@ -1076,14 +1139,8 @@ bootstrap_mnemosyne_into_hermes_venv() {
   [[ -n "$HERMES_REAL_BIN" && -x "$HERMES_REAL_BIN" ]] \
     || fail "HERMES_REAL_BIN is not set/executable. install_hermes must run before install_mnemosyne."
 
-  # Hermes's launcher script's shebang points at its actual uv-managed
-  # interpreter — this is reliable where guessing via `python3` on PATH
-  # is not (PATH can resolve to the system interpreter instead).
-  hermes_python="$(run_as_aaas head -n1 "$HERMES_REAL_BIN" | sed -n 's/^#!//p')"
-
-  if [[ -z "$hermes_python" || ! -x "$hermes_python" ]]; then
-    fail "Could not resolve Hermes's own python interpreter from ${HERMES_REAL_BIN}'s shebang (got: '${hermes_python}')."
-  fi
+  hermes_python="$(resolve_hermes_python)" \
+    || fail "Could not resolve Hermes's own python interpreter (checked shebang, wrapper contents, and runtime introspection)."
 
   if run_as_aaas "$hermes_python" -c "import mnemosyne_hermes" >/dev/null 2>&1; then
     ok "mnemosyne-hermes already importable from Hermes's own interpreter (${hermes_python}); skipping bootstrap."
@@ -1127,6 +1184,15 @@ bootstrap_mnemosyne_into_hermes_venv() {
 #     hermes config set memory.provider mnemosyne
 #     hermes gateway restart
 #
+# mnemosyne-hermes's OWN "install --force" step tries to auto-bootstrap
+# itself into Hermes's venv, but that venv is uv-managed (PEP 668
+# externally-managed) and its auto-bootstrap does a plain pip install
+# with no --break-system-packages, which always fails there. So
+# install.sh performs that bootstrap itself, correctly, via
+# bootstrap_mnemosyne_into_hermes_venv() BEFORE calling
+# `mnemosyne-hermes install --force` — at which point the auto-bootstrap
+# finds the import already satisfied and skips its broken logic.
+#
 # The platform/.hermes/config.yaml bootstrap must set:
 #   memory:
 #     memory_enabled: false        — disables built-in MEMORY.md injection
@@ -1139,23 +1205,26 @@ bootstrap_mnemosyne_into_hermes_venv() {
 # config.yaml instead.
 #
 # MNEMOSYNE_HOST_LLM_ENABLED routes consolidation LLM calls through Hermes's
-# own authenticated provider — no separate API key needed.
+# own authenticated provider — no separate API key needed. It does NOT
+# cover embeddings (text-in/vector-out is a different API surface most
+# chat providers don't expose) — embeddings still need either a local
+# model (embeddings/all profile) or MNEMOSYNE_EMBEDDING_API_URL pointed
+# at a real embeddings endpoint.
 # This env var belongs in ~/.hermes/.env (read by Hermes at startup), NOT
 # in the AaaS platform .env (only read by watchdog/opencode).
 #
 # Data lives at ~/.hermes/mnemosyne/data/ (upstream default).
 #
 # Install profile is controlled by MNEMOSYNE_INSTALL_PROFILE env var:
-#   unset / ""   → mnemosyne-memory (core, default, ~50 MB)
-#   "embeddings" → mnemosyne-memory[embeddings] (~800 MB, needs 2 GB free RAM)
-#   "all"        → mnemosyne-memory[all] (~1.5 GB, needs 8 GB+ free RAM)
-#
-# Plugin registration: `mnemosyne-hermes install --force` (run from the
-# standalone venv) is the documented, supported way to register the plugin
-# with Hermes. It replaces the previous manual-symlink workaround for
-# NousResearch/hermes-agent#40101 — that workaround assumed the package
-# lived inside Hermes's own venv, which is no longer true now that
-# mnemosyne-hermes is installed into its own standalone venv.
+#   unset / ""   → embeddings (default — local fastembed model, ~800 MB,
+#                  needed for working semantic recall out of the box
+#                  without wiring up a separate external embeddings API)
+#   "embeddings" → same as default, explicit
+#   "all"        → mnemosyne-memory[all] (~1.5 GB, needs 8 GB+ free RAM,
+#                  adds local LLM via llama-cpp-python)
+#   (empty/core is only reachable by unsetting the default logic below;
+#    core has NO local embedding backend — semantic recall requires
+#    MNEMOSYNE_EMBEDDING_API_URL to be set separately, or degrades)
 # ---------------------------------------------------------------------------
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
@@ -1163,20 +1232,21 @@ install_mnemosyne() {
   local mnemosyne_venv="${AAAS_HOME}/.hermes/mnemosyne-venv"
   local venv_python="${mnemosyne_venv}/bin/python"
   local hermes_env="${AAAS_HOME}/.hermes/.env"
-  local profile="${MNEMOSYNE_INSTALL_PROFILE:-}"
+  local profile="${MNEMOSYNE_INSTALL_PROFILE:-embeddings}"
 
   # ------------------------------------------------------------------
   # 1. Create a standalone venv dedicated to Mnemosyne, fully separate
   #    from Hermes's own managed venv (${AAAS_HOME}/.hermes/hermes-agent/venv).
   #    `hermes update` rebuilds that managed venv and wipes any extra
   #    packages installed into it, so Mnemosyne must never live there.
+  #
+  #    Idempotency guard: a venv is only "already good" if pip actually
+  #    works in it. A prior failed attempt (e.g. missing ensurepip) can
+  #    leave a venv_dir with bin/python3 present but no working pip —
+  #    don't treat that as done, wipe and recreate.
   # ------------------------------------------------------------------
   ensure_venv_ensurepip_support
 
-  # Idempotency guard: a venv is only "already good" if pip actually works
-  # in it. A prior failed attempt (e.g. missing ensurepip) can leave a
-  # venv_dir with bin/python3 present but no working pip — don't treat
-  # that as done, wipe and recreate.
   if [[ -x "$venv_python" ]] && run_as_aaas "$venv_python" -m pip --version >/dev/null 2>&1; then
     ok "Mnemosyne standalone venv already exists and has working pip at ${mnemosyne_venv}."
   else
@@ -1221,27 +1291,15 @@ install_mnemosyne() {
   fi
 
   # ------------------------------------------------------------------
-  # 3. Bootstrap mnemosyne-hermes into Hermes's OWN venv first.
-  #
-  #    Hermes's venv (AAAS_HOME/.hermes/hermes-agent/venv, built by uv)
-  #    is a PEP 668 externally-managed environment. mnemosyne-hermes's
-  #    own "install --force" tries to auto-bootstrap into it with a
-  #    plain pip install and no --break-system-packages, which always
-  #    fails there with "externally-managed-environment" — the error's
-  #    own hint says to use `uv pip install --python ... --break-system-
-  #    packages` instead. So we do that bootstrap ourselves, up front,
-  #    idempotently, and only then call mnemosyne-hermes install --force
-  #    to do the actual plugin registration (which at that point finds
-  #    the import already satisfied and skips its broken auto-bootstrap).
+  # 3. Bootstrap mnemosyne-hermes into Hermes's OWN venv first (see the
+  #    function docstring above for why this must happen before step 4).
   # ------------------------------------------------------------------
   bootstrap_mnemosyne_into_hermes_venv "$profile"
 
   # ------------------------------------------------------------------
   # 4. Register the plugin with Hermes using mnemosyne-hermes's own
   #    installer, run from the standalone venv. This is the documented
-  #    registration path and is safe to rerun via --force, so it
-  #    replaces the previous manual symlink-into-~/.hermes/plugins/
-  #    workaround (which assumed an in-Hermes-venv install).
+  #    registration path and is safe to rerun via --force.
   # ------------------------------------------------------------------
   run_as_aaas "${mnemosyne_venv}/bin/mnemosyne-hermes" install --force
   ok "Registered the mnemosyne plugin with Hermes (mnemosyne-hermes install --force)."
@@ -1258,7 +1316,8 @@ install_mnemosyne() {
   # 6. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
   #    This routes Mnemosyne's consolidation and fact-extraction LLM
   #    calls through Hermes's own authenticated provider, so no
-  #    separate API key is needed for memory operations.
+  #    separate API key is needed for memory operations. It does NOT
+  #    cover embeddings — see the profile note above.
   #
   #    ~/.hermes/.env is the correct location — Hermes reads it at
   #    startup. The AaaS platform .env (CONFIG_FILE) is only consumed
@@ -1275,7 +1334,7 @@ install_mnemosyne() {
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_env"
   run $SUDO chmod 660 "$hermes_env"
 
-  ok "Mnemosyne install complete (standalone venv: ${mnemosyne_venv})."
+  ok "Mnemosyne install complete (standalone venv: ${mnemosyne_venv}, profile: ${profile:-core})."
   ok "Data will live at ${AAAS_HOME}/.hermes/mnemosyne/data/"
   warn "After gateway restart, verify with:"
   warn "  sudo -u ${AAAS_USER} hermes plugins list | grep mnemosyne"
@@ -1600,9 +1659,11 @@ summary() {
   printf "     (source ${CONFIG_FILE} first to get HERMES_REAL_BIN, or resolve it fresh with:\n"
   printf "       ${BOLD}sudo \$(sudo -u %s bash -li -c 'command -v hermes') gateway restart --system${RESET})\n" "$AAAS_USER"
   printf "\n"
-  printf "  6. (Optional) Use local embeddings for better memory recall:\n"
-  printf "       Set MNEMOSYNE_INSTALL_PROFILE=embeddings and rerun install.sh\n"
-  printf "       Requires ~800 MB RAM. For full local LLM use 'all' (~1.5 GB, 8 GB+ RAM).\n"
+  printf "  6. Mnemosyne install profile is controlled by MNEMOSYNE_INSTALL_PROFILE\n"
+  printf "     (default: embeddings, ~800 MB, local semantic recall out of the box).\n"
+  printf "     Set to 'all' for a full local LLM (~1.5 GB, 8 GB+ RAM), or unset/empty\n"
+  printf "     for core only (~50 MB, requires MNEMOSYNE_EMBEDDING_API_URL for semantic\n"
+  printf "     recall) — then rerun install.sh.\n"
   printf "\n"
   printf "%sHermes gateway note:%s\n" "${BOLD}" "${RESET}"
   printf "  The gateway is installed as a systemd system service, which means it\n"
