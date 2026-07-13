@@ -1001,6 +1001,66 @@ write_default_hermes_soul_bootstrap() {
 }
 
 # ---------------------------------------------------------------------------
+# ensure_venv_ensurepip_support — make sure `python3 -m venv` actually
+# produces a venv with a working pip. `python3 -m venv --help` always
+# succeeds regardless of ensurepip availability, so it cannot be used to
+# detect this; instead we create a throwaway venv and check for pip.
+#
+# On Debian/Ubuntu, ensurepip support ships in a *version-specific*
+# package (e.g. python3.14-venv), not always covered by the generic
+# "python3-venv" package name if python3 is newer than the distro
+# default target. Try the version-specific package first, then fall back.
+# ---------------------------------------------------------------------------
+ensure_venv_ensurepip_support() {
+  local probe_dir
+  probe_dir="$(mktemp -d)"
+
+  if python3 -m venv "${probe_dir}/probe" >/dev/null 2>&1 \
+     && [[ -x "${probe_dir}/probe/bin/pip" || -x "${probe_dir}/probe/bin/pip3" ]]; then
+    rm -rf "$probe_dir"
+    return 0
+  fi
+  rm -rf "$probe_dir"
+
+  case "$(detect_pm)" in
+    apt)
+      local pyver pkg
+      pyver="$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+      pkg="python3.${pyver#3.}-venv"
+      run_apt update
+      if ! run_apt install -y "$pkg" 2>/dev/null; then
+        warn "Package ${pkg} not found; falling back to python3-venv."
+        run_apt install -y python3-venv
+      fi
+      ;;
+    dnf)
+      run $SUDO dnf install -y python3-virtualenv || true
+      ;;
+    yum)
+      run $SUDO yum install -y python3-virtualenv || true
+      ;;
+    pacman|brew)
+      ok "$(detect_pm)-based python3 should already include venv/ensurepip support."
+      ;;
+    *)
+      warn "Could not determine package manager; install venv/ensurepip support for python3 manually."
+      ;;
+  esac
+
+  # Re-verify; fail loudly rather than let venv creation silently produce
+  # a pip-less environment again.
+  probe_dir="$(mktemp -d)"
+  if python3 -m venv "${probe_dir}/probe" >/dev/null 2>&1 \
+     && [[ -x "${probe_dir}/probe/bin/pip" || -x "${probe_dir}/probe/bin/pip3" ]]; then
+    rm -rf "$probe_dir"
+    ok "python3 -m venv now produces a working pip."
+  else
+    rm -rf "$probe_dir"
+    fail "python3 -m venv still cannot bootstrap pip. Install manually: apt install python3-venv (or the python3.X-venv matching '$(python3 --version)')."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Install Mnemosyne as Hermes's sole memory provider.
 #
 # Canonical method per https://docs.mnemosyne.site/api/hermes-plugin:
@@ -1063,29 +1123,27 @@ install_mnemosyne() {
   #    `hermes update` rebuilds that managed venv and wipes any extra
   #    packages installed into it, so Mnemosyne must never live there.
   # ------------------------------------------------------------------
-  if ! run_as_aaas python3 -m venv --help >/dev/null 2>&1; then
-    case "$(detect_pm)" in
-      apt)
-        run_apt update
-        run_apt install -y python3-venv
-        ;;
-      *)
-        warn "python3 venv module not detected; attempting venv creation anyway."
-        ;;
-    esac
-  fi
+  ensure_venv_ensurepip_support
 
-  if [[ -x "$venv_python" ]]; then
-    ok "Mnemosyne standalone venv already exists at ${mnemosyne_venv}."
+  # Idempotency guard: a venv is only "already good" if pip actually works
+  # in it. A prior failed attempt (e.g. missing ensurepip) can leave a
+  # venv_dir with bin/python3 present but no working pip — don't treat
+  # that as done, wipe and recreate.
+  if [[ -x "$venv_python" ]] && run_as_aaas "$venv_python" -m pip --version >/dev/null 2>&1; then
+    ok "Mnemosyne standalone venv already exists and has working pip at ${mnemosyne_venv}."
   else
+    if [[ -d "$mnemosyne_venv" ]]; then
+      warn "Existing mnemosyne-venv at ${mnemosyne_venv} is broken (no working pip); recreating."
+      run_as_aaas rm -rf "$mnemosyne_venv"
+    fi
     install_banner "mnemosyne standalone venv"
-    run_as_aaas python3 -m venv "$mnemosyne_venv"
+    run_as_aaas python3 -m venv "$mnemosyne_venv" \
+      || fail "Failed to create venv at ${mnemosyne_venv} even after installing venv support."
+    run_as_aaas "$venv_python" -m ensurepip --upgrade \
+      || fail "python3 -m venv succeeded but ensurepip still failed inside ${mnemosyne_venv}. Check python3-venv / python3-pip installation."
     ok "Created standalone venv at ${mnemosyne_venv}."
   fi
 
-  # uv-built venvs aside, a plain `python3 -m venv` venv already ships pip;
-  # ensurepip --upgrade is a harmless no-op when pip is already current.
-  run_as_aaas "$venv_python" -m ensurepip --upgrade >/dev/null 2>&1 || true
   run_as_aaas "$venv_python" -m pip install --quiet --upgrade pip
 
   # ------------------------------------------------------------------
