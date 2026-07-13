@@ -1152,16 +1152,18 @@ resolve_and_fix_mnemosyne_hermes_bootstrap() {
   local venv_bin="$1"
   local attempt_output status target_python target_pkg
 
-  # Temporarily disable errexit: a non-zero exit here is an EXPECTED,
-  # handled case (first-run externally-managed-environment failure), not
-  # a fatal error. Under `set -e`, a bare `var="$(cmd)"` assignment
-  # propagates cmd's exit status as the statement's own status, which
-  # would otherwise kill the whole script right here before we get a
-  # chance to inspect and react to the failure.
+  # A non-zero exit here is an EXPECTED, handled case (first-run
+  # externally-managed-environment failure), not a fatal error. BOTH the
+  # ERR trap (fires based on syntactic context, independent of -e) AND
+  # errexit itself (kills the script directly, independent of the trap)
+  # must be disabled together around this call, or one or the other will
+  # still kill the script before we get to inspect the failure ourselves.
+  trap - ERR
   set +e
   attempt_output="$(run_as_aaas "${venv_bin}/mnemosyne-hermes" install --force 2>&1)"
   status=$?
   set -e
+  trap 'fail "Installation stopped near line ${LINENO}."' ERR
 
   printf '%s\n' "$attempt_output"
 
