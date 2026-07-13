@@ -1150,10 +1150,19 @@ resolve_hermes_python() {
 # ---------------------------------------------------------------------------
 resolve_and_fix_mnemosyne_hermes_bootstrap() {
   local venv_bin="$1"
-  local attempt_output target_python target_pkg
+  local attempt_output status target_python target_pkg
 
+  # Temporarily disable errexit: a non-zero exit here is an EXPECTED,
+  # handled case (first-run externally-managed-environment failure), not
+  # a fatal error. Under `set -e`, a bare `var="$(cmd)"` assignment
+  # propagates cmd's exit status as the statement's own status, which
+  # would otherwise kill the whole script right here before we get a
+  # chance to inspect and react to the failure.
+  set +e
   attempt_output="$(run_as_aaas "${venv_bin}/mnemosyne-hermes" install --force 2>&1)"
-  local status=$?
+  status=$?
+  set -e
+
   printf '%s\n' "$attempt_output"
 
   if [[ $status -eq 0 ]]; then
