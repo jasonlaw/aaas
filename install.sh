@@ -1073,41 +1073,31 @@ bootstrap_mnemosyne_into_hermes_venv() {
   local profile="$1"
   local hermes_python
 
-  # Resolve Hermes's own interpreter (the uv-built one, not the standalone
-  # mnemosyne venv) directly from the running hermes binary.
-  hermes_python="$(run_as_aaas bash -li -c \
-    "hermes --python-path 2>/dev/null || true")"
+  [[ -n "$HERMES_REAL_BIN" && -x "$HERMES_REAL_BIN" ]] \
+    || fail "HERMES_REAL_BIN is not set/executable. install_hermes must run before install_mnemosyne."
+
+  # Hermes's launcher script's shebang points at its actual uv-managed
+  # interpreter — this is reliable where guessing via `python3` on PATH
+  # is not (PATH can resolve to the system interpreter instead).
+  hermes_python="$(run_as_aaas head -n1 "$HERMES_REAL_BIN" | sed -n 's/^#!//p')"
 
   if [[ -z "$hermes_python" || ! -x "$hermes_python" ]]; then
-    # Fall back to deriving it the same way the auto-bootstrap error showed:
-    # the venv sitting alongside hermes's uv toolchain.
-    hermes_python="$(run_as_aaas bash -li -c \
-      'python3 -c "import sys; print(sys.executable)"' 2>/dev/null || true)"
+    fail "Could not resolve Hermes's own python interpreter from ${HERMES_REAL_BIN}'s shebang (got: '${hermes_python}')."
   fi
-
-  [[ -n "$hermes_python" && -x "$hermes_python" ]] \
-    || fail "Could not resolve Hermes's own python interpreter to bootstrap mnemosyne-hermes into it."
 
   if run_as_aaas "$hermes_python" -c "import mnemosyne_hermes" >/dev/null 2>&1; then
     ok "mnemosyne-hermes already importable from Hermes's own interpreter (${hermes_python}); skipping bootstrap."
     return
   fi
 
-  local pkg
-  if [[ -n "$profile" ]]; then
-    pkg="mnemosyne-hermes[${profile}]"
-  else
-    pkg="mnemosyne-hermes[all]"
-  fi
+  local pkg="mnemosyne-hermes[${profile:-embeddings}]"
 
   install_banner "mnemosyne-hermes bootstrap into Hermes venv"
 
-  if have uv || run_as_aaas bash -li -c "command -v uv >/dev/null 2>&1"; then
+  if run_as_aaas bash -li -c "command -v uv >/dev/null 2>&1"; then
     run_as_aaas bash -li -c "uv pip install --python '${hermes_python}' --break-system-packages -U '${pkg}'" \
       || fail "uv pip install of ${pkg} into Hermes's venv (${hermes_python}) failed."
   else
-    # No uv on PATH for aaas — fall back to the interpreter's own pip with
-    # the same override flag the error message calls for.
     run_as_aaas "$hermes_python" -m pip install --quiet --upgrade --break-system-packages "$pkg" \
       || fail "pip install --break-system-packages of ${pkg} into Hermes's venv (${hermes_python}) failed."
   fi
