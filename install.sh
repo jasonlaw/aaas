@@ -435,6 +435,32 @@ ensure_aaas_profile() {
   ok "Updated ${profile} to source .bashrc for login shells."
 }
 
+# ---------------------------------------------------------------------------
+# provision_aaas_directories — create every directory install.sh itself
+# needs up front, all owned by aaas:aaas via ensure_owned_dir. Must run
+# after ensure_aaas_user, since AAAS_HOME is only resolved there.
+#
+# Directories created later by Hermes, opencode, or Docker themselves
+# (e.g. AAAS_HOME/.hermes/hermes-agent) are provisioned by those tools,
+# not listed here.
+# ---------------------------------------------------------------------------
+provision_aaas_directories() {
+  step "Provisioning AaaS directory layout"
+
+  local dir
+  local dirs=(
+    "$ROOT_DIR"
+    "$PLATFORM_DIR"
+    "${AAAS_HOME}/.hermes"
+    "${AAAS_HOME}/.hermes/skills"
+    "$WATCHDOG_DIR"
+  )
+
+  for dir in "${dirs[@]}"; do
+    ensure_owned_dir "$dir"
+  done
+}
+
 sync_platform_files() {
   step "Cloning platform presetup"
 
@@ -518,7 +544,7 @@ install_packages() {
   esac
 }
 
-ensure_base_tools() {
+install_base_packages() {
   step "Preparing the runway"
   local tool missing=()
 
@@ -540,7 +566,7 @@ ensure_base_tools() {
   ok "Base tools are ready."
 }
 
-ensure_node() {
+install_node() {
   step "Installing Node.js and npm"
 
   if have node && have npm; then
@@ -564,7 +590,7 @@ ensure_node() {
   have node && have npm && ok "Node and npm are installed." || warn "Node/npm still need manual installation."
 }
 
-ensure_opencode() {
+install_opencode() {
   step "Installing opencode"
 
   refresh_path
@@ -598,7 +624,7 @@ ensure_opencode() {
 # PyYAML is required to merge .hermes/config.yaml (staging) into whatever
 # config.yaml the Hermes setup wizard produces, without clobbering other
 # top-level keys or introducing duplicate YAML keys.
-ensure_python_yaml() {
+install_python_yaml() {
   step "Checking for PyYAML"
 
   if have python3 && python3 -c "import yaml" >/dev/null 2>&1; then
@@ -635,7 +661,7 @@ ensure_python_yaml() {
   fi
 }
 
-ensure_docker() {
+install_docker() {
   step "Installing Docker Engine"
 
   if have docker; then
@@ -1481,26 +1507,31 @@ summary() {
 
 main() {
   banner
-  ensure_base_tools
-  ensure_aaas_user          # must come before ensure_owned_dir calls
-  ensure_owned_dir "$ROOT_DIR"
-  ensure_owned_dir "$PLATFORM_DIR"
-  ensure_owned_dir "${AAAS_HOME}/.hermes"
-  ensure_owned_dir "${AAAS_HOME}/.hermes/skills"
-  ensure_owned_dir "$WATCHDOG_DIR"
+
+  # --- Service account & filesystem layout ---------------------------------
+  install_base_packages
+  ensure_aaas_user            # must run first: resolves AAAS_HOME
+  provision_aaas_directories  # depends on AAAS_HOME from ensure_aaas_user
   ensure_aaas_profile         # must run before install_hermes
+
+  # --- Platform source & core dependencies ----------------------------------
   sync_platform_files
-  ensure_node
-  ensure_opencode
-  ensure_python_yaml
-  ensure_docker
+  install_node
+  install_opencode
+  install_python_yaml
+  install_docker
+
+  # --- Hermes runtime & Mnemosyne memory -------------------------------------
   install_hermes
-  ensure_watchdog_sudo        # needs HERMES_REAL_BIN from install_hermes
+  ensure_watchdog_sudo         # needs HERMES_REAL_BIN from install_hermes
   install_mnemosyne
+
+  # --- Watchdog & service wiring ----------------------------------------------
   write_watchdog
   write_opencode_hermes_skill
   verify_hermes_runtime
   install_watchdog_service
+
   summary
 }
 
