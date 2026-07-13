@@ -983,19 +983,21 @@ write_default_hermes_soul_bootstrap() {
 # ---------------------------------------------------------------------------
 # Install Mnemosyne as Hermes's sole memory provider.
 #
-# Canonical method per https://github.com/mnemosyne-oss/mnemosyne:
+# Canonical method per https://docs.mnemosyne.site/api/hermes-plugin:
 #
-#   pip install mnemosyne-hermes        — plugin wrapper + entry points
-#                                         (always required for Hermes)
-#   + one of:
-#   pip install mnemosyne-memory        — core only, ~50 MB RAM
-#                                         no local embeddings; point
-#                                         MNEMOSYNE_EMBEDDING_API_URL externally
-#   pip install mnemosyne-memory[embeddings]  — adds fastembed, ~800 MB RAM
-#   pip install mnemosyne-memory[all]   — full local LLM + embeddings, ~1.5 GB
+#   Do NOT install inside Hermes' managed venv — `hermes update` rebuilds
+#   the venv and wipes extra packages. The docs recommend pipx as the
+#   primary path, with a dedicated/standalone venv documented as the
+#   fallback. install.sh uses the standalone-venv fallback (not pipx) so
+#   the install location, ownership, and permissions stay fully under
+#   AaaS's own control, with no dependency on pipx being present on the
+#   target system:
 #
-#   hermes config set memory.provider mnemosyne
-#   hermes memory setup                 — activates the provider
+#     python3 -m venv ~/.hermes/mnemosyne-venv
+#     ~/.hermes/mnemosyne-venv/bin/pip install mnemosyne-hermes
+#     ~/.hermes/mnemosyne-venv/bin/mnemosyne-hermes install --force
+#     hermes config set memory.provider mnemosyne
+#     hermes gateway restart
 #
 # The platform/.hermes/config.yaml bootstrap must set:
 #   memory:
@@ -1004,7 +1006,9 @@ write_default_hermes_soul_bootstrap() {
 #     provider: mnemosyne
 #
 # IMPORTANT: do NOT use `hermes tools disable memory` — that also kills all
-# 23 Mnemosyne-registered tools. Use memory_enabled: false in config.yaml.
+# 25 Mnemosyne-registered tools (the "memory" toolset key gates both the
+# built-in tool and memory provider tools). Use memory_enabled: false in
+# config.yaml instead.
 #
 # MNEMOSYNE_HOST_LLM_ENABLED routes consolidation LLM calls through Hermes's
 # own authenticated provider — no separate API key needed.
@@ -1018,44 +1022,56 @@ write_default_hermes_soul_bootstrap() {
 #   "embeddings" → mnemosyne-memory[embeddings] (~800 MB, needs 2 GB free RAM)
 #   "all"        → mnemosyne-memory[all] (~1.5 GB, needs 8 GB+ free RAM)
 #
-# IMPORTANT — plugin discovery: Hermes discovers memory providers by
-# scanning ~/.hermes/plugins/ on disk, NOT by reading pip entry-point
-# metadata alone (see NousResearch/hermes-agent#40101). A pip install of
-# mnemosyne-hermes without the matching symlink below leaves
-# `hermes memory status` reporting "Plugin: NOT installed" even though the
-# package imports fine and memory.provider is set correctly. Step 5b below
-# creates that symlink.
+# Plugin registration: `mnemosyne-hermes install --force` (run from the
+# standalone venv) is the documented, supported way to register the plugin
+# with Hermes. It replaces the previous manual-symlink workaround for
+# NousResearch/hermes-agent#40101 — that workaround assumed the package
+# lived inside Hermes's own venv, which is no longer true now that
+# mnemosyne-hermes is installed into its own standalone venv.
 # ---------------------------------------------------------------------------
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
 
-  local hermes_venv="${AAAS_HOME}/.hermes/hermes-agent/venv"
-  local venv_python="${hermes_venv}/bin/python"
+  local mnemosyne_venv="${AAAS_HOME}/.hermes/mnemosyne-venv"
+  local venv_python="${mnemosyne_venv}/bin/python"
   local hermes_env="${AAAS_HOME}/.hermes/.env"
   local profile="${MNEMOSYNE_INSTALL_PROFILE:-}"
 
   # ------------------------------------------------------------------
-  # 1. Verify the Hermes venv exists.
+  # 1. Create a standalone venv dedicated to Mnemosyne, fully separate
+  #    from Hermes's own managed venv (${AAAS_HOME}/.hermes/hermes-agent/venv).
+  #    `hermes update` rebuilds that managed venv and wipes any extra
+  #    packages installed into it, so Mnemosyne must never live there.
   # ------------------------------------------------------------------
-  if [[ ! -x "$venv_python" ]]; then
-    fail "Hermes venv not found at ${venv_python}. Confirm with: ls ${hermes_venv}/bin/"
+  if ! run_as_aaas python3 -m venv --help >/dev/null 2>&1; then
+    case "$(detect_pm)" in
+      apt)
+        run_apt update
+        run_apt install -y python3-venv
+        ;;
+      *)
+        warn "python3 venv module not detected; attempting venv creation anyway."
+        ;;
+    esac
   fi
-  ok "Hermes venv found at ${hermes_venv}."
+
+  if [[ -x "$venv_python" ]]; then
+    ok "Mnemosyne standalone venv already exists at ${mnemosyne_venv}."
+  else
+    install_banner "mnemosyne standalone venv"
+    run_as_aaas python3 -m venv "$mnemosyne_venv"
+    ok "Created standalone venv at ${mnemosyne_venv}."
+  fi
+
+  # uv-built venvs aside, a plain `python3 -m venv` venv already ships pip;
+  # ensurepip --upgrade is a harmless no-op when pip is already current.
+  run_as_aaas "$venv_python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  run_as_aaas "$venv_python" -m pip install --quiet --upgrade pip
 
   # ------------------------------------------------------------------
-  # 2. Bootstrap pip — Hermes venv is built by uv with --no-pip.
-  #    ensurepip is idempotent; --upgrade is a no-op if pip is current.
-  # ------------------------------------------------------------------
-  run_as_aaas "$venv_python" -m ensurepip --upgrade
-
-  # ------------------------------------------------------------------
-  # 3. Install the core library with the chosen profile, plus the
-  #    mnemosyne-hermes plugin wrapper (always required for Hermes).
-  #
-  #    mnemosyne-hermes wraps mnemosyne-memory with the plugin manifest
-  #    and entry points that Hermes's plugin system discovers. Both
-  #    packages must be present; installing mnemosyne-memory alone is
-  #    not sufficient for Hermes to recognise the provider.
+  # 2. Install mnemosyne-hermes (the Hermes plugin wrapper) plus the
+  #    chosen mnemosyne-memory profile into the standalone venv —
+  #    never into Hermes's own managed venv.
   # ------------------------------------------------------------------
   local core_pkg
   if [[ -n "$profile" ]]; then
@@ -1071,12 +1087,22 @@ install_mnemosyne() {
   installed_hermes_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-hermes 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
 
   if [[ -n "$installed_core_ver" && -n "$installed_hermes_ver" ]]; then
-    ok "mnemosyne-memory ${installed_core_ver} and mnemosyne-hermes ${installed_hermes_ver} already installed; skipping."
+    ok "mnemosyne-memory ${installed_core_ver} and mnemosyne-hermes ${installed_hermes_ver} already installed in the standalone venv; skipping."
   else
-    install_banner "mnemosyne (${core_pkg} + mnemosyne-hermes)"
+    install_banner "mnemosyne (${core_pkg} + mnemosyne-hermes) in standalone venv"
     run_as_aaas "$venv_python" -m pip install --quiet --upgrade "$core_pkg" mnemosyne-hermes
-    ok "Installed ${core_pkg} and mnemosyne-hermes in Hermes venv."
+    ok "Installed ${core_pkg} and mnemosyne-hermes into ${mnemosyne_venv}."
   fi
+
+  # ------------------------------------------------------------------
+  # 3. Register the plugin with Hermes using mnemosyne-hermes's own
+  #    installer, run from the standalone venv. This is the documented
+  #    registration path and is safe to rerun via --force, so it
+  #    replaces the previous manual symlink-into-~/.hermes/plugins/
+  #    workaround (which assumed an in-Hermes-venv install).
+  # ------------------------------------------------------------------
+  run_as_aaas "${mnemosyne_venv}/bin/mnemosyne-hermes" install --force
+  ok "Registered the mnemosyne plugin with Hermes (mnemosyne-hermes install --force)."
 
   # ------------------------------------------------------------------
   # 4. Register mnemosyne as the active memory provider.
@@ -1087,63 +1113,7 @@ install_mnemosyne() {
   ok "memory.provider set to mnemosyne in Hermes config."
 
   # ------------------------------------------------------------------
-  # 5. Activate the provider — idempotent guard first.
-  #    `hermes memory setup` is not documented as idempotent: on a
-  #    second run it may prompt, error, or attempt to reinitialise an
-  #    already-active provider, which could trip set -e.
-  #
-  #    Guard: skip setup entirely if BOTH conditions are true:
-  #      a) the plugin directory already exists (setup ran before), AND
-  #      b) config already names mnemosyne as the provider.
-  #    If either is missing, run setup. The warn path is a soft
-  #    fallback for TTY-only environments; it does not abort the install.
-  # ------------------------------------------------------------------
-  local plugins_dir="${AAAS_HOME}/.hermes/plugins/mnemosyne"
-  local current_provider
-  current_provider="$(run_as_aaas bash -li -c \
-    "hermes config get memory.provider 2>/dev/null || true")"
-
-  if [[ -d "$plugins_dir" && "$current_provider" == "mnemosyne" ]]; then
-    ok "Mnemosyne provider already active (plugin dir exists, provider confirmed); skipping hermes memory setup."
-  elif run_as_aaas bash -li -c \
-    "hermes memory setup --provider mnemosyne --non-interactive" 2>/dev/null; then
-    ok "Mnemosyne provider activated via hermes memory setup."
-  else
-    warn "hermes memory setup could not run non-interactively (may need a TTY)."
-    warn "Run manually after install: sudo -u ${AAAS_USER} hermes memory setup"
-    warn "Select 'mnemosyne' from the picker when prompted."
-  fi
-
-  # ------------------------------------------------------------------
-  # 5b. Symlink the plugin into Hermes's discovery directory.
-  #     Hermes discovers plugins by scanning ~/.hermes/plugins/ on disk,
-  #     not by reading pip entry-point metadata. Without this symlink,
-  #     `hermes memory status` reports "Plugin: NOT installed" even
-  #     though mnemosyne-hermes is correctly pip-installed and the
-  #     provider is set in config.yaml (upstream: hermes-agent #40101).
-  #
-  #     Guard: skip if the symlink already exists AND resolves under the
-  #     currently-installed package path (so a pip upgrade that moves the
-  #     package will still trigger a re-link on the next install.sh run).
-  # ------------------------------------------------------------------
-  local plugin_link="${AAAS_HOME}/.hermes/plugins/mnemosyne"
-  local plugin_src
-  plugin_src="$(run_as_aaas "$venv_python" -c \
-    "import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)" 2>/dev/null || true)"
-
-  if [[ -z "$plugin_src" ]]; then
-    warn "Could not resolve mnemosyne_hermes package path; skipping plugin symlink."
-    warn "Check manually: sudo -u ${AAAS_USER} bash -li -c \"hermes memory status\""
-  elif [[ -L "$plugin_link" && "$(readlink -f "$plugin_link" 2>/dev/null)" == "$(readlink -f "$plugin_src" 2>/dev/null)"* ]]; then
-    ok "Plugin symlink already points at ${plugin_src}; skipping."
-  else
-    run_as_aaas mkdir -p "$plugin_link"
-    run_as_aaas bash -c "ln -sfn \"${plugin_src}\"/* \"${plugin_link}/\""
-    ok "Symlinked mnemosyne plugin files into ${plugin_link}."
-  fi
-
-  # ------------------------------------------------------------------
-  # 6. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
+  # 5. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
   #    This routes Mnemosyne's consolidation and fact-extraction LLM
   #    calls through Hermes's own authenticated provider, so no
   #    separate API key is needed for memory operations.
@@ -1163,11 +1133,11 @@ install_mnemosyne() {
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_env"
   run $SUDO chmod 660 "$hermes_env"
 
-  ok "Mnemosyne install complete."
+  ok "Mnemosyne install complete (standalone venv: ${mnemosyne_venv})."
   ok "Data will live at ${AAAS_HOME}/.hermes/mnemosyne/data/"
   warn "After gateway restart, verify with:"
-  warn "  sudo -u ${AAAS_USER} hermes memory status"
-  warn "  sudo -u ${AAAS_USER} hermes tools list | grep mnemosyne"
+  warn "  sudo -u ${AAAS_USER} hermes plugins list | grep mnemosyne"
+  warn "  sudo -u ${AAAS_USER} hermes mnemosyne stats"
   warn "  sudo -u ${AAAS_USER} hermes doctor | grep -A5 'Memory Provider'"
 }
 
@@ -1473,8 +1443,8 @@ summary() {
   printf "     Mnemosyne will route its consolidation calls through that same provider.\n"
   printf "\n"
   printf "  2. Verify Mnemosyne is active:\n"
-  printf "       ${BOLD}sudo -u %s hermes memory status${RESET}\n" "$AAAS_USER"
-  printf "       ${BOLD}sudo -u %s hermes tools list | grep mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes plugins list | grep mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes mnemosyne stats${RESET}\n" "$AAAS_USER"
   printf "       ${BOLD}sudo -u %s hermes doctor | grep -A5 'Memory Provider'${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  3. (Optional) Add a fallback provider for reliability:\n"
