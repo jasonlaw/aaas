@@ -1175,8 +1175,8 @@ resolve_and_fix_mnemosyne_hermes_bootstrap() {
 
   # Parse the tool's own suggested fix line, e.g.:
   #   uv pip install --python /home/aaas/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11 -U 'mnemosyne-hermes[all]'
-  target_python="$(grep -oE -- '--python[[:space:]]+[^[:space:]]+' <<<"$attempt_output" | head -n1 | awk '{print $2}')"
-  target_pkg="$(grep -oE "'[^']*mnemosyne-hermes[^']*'" <<<"$attempt_output" | head -n1 | tr -d "'")"
+  target_python="$(grep -oE -- '--python[[:space:]]+[^[:space:]]+' <<<"$attempt_output" | head -n1 | awk '{print $2}')" || true
+  target_pkg="$(grep -oE "'[^']*mnemosyne-hermes[^']*'" <<<"$attempt_output" | head -n1 | tr -d "'")" || true
 
   [[ -n "$target_python" ]] || fail "Could not parse the target python interpreter from mnemosyne-hermes's own bootstrap error output."
   [[ -n "$target_pkg" ]] || target_pkg="mnemosyne-hermes"
