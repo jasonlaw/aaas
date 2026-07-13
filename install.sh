@@ -959,8 +959,7 @@ PYEOF
   ok "Applied .hermes/config.yaml to config.yaml."
 }
 
-# Resolves __PLATFORM_DIR__ and __HERMES_HOME__ placeholders in the
-# bootstrap config.yaml before write_hermes_config_yaml applies it.
+# Resolves __PLATFORM_DIR__ in the bootstrap config.yaml before write_hermes_config_yaml applies it.
 resolve_config_bootstrap_placeholders() {
   local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
 
@@ -969,11 +968,6 @@ resolve_config_bootstrap_placeholders() {
   if grep -q '__PLATFORM_DIR__' "$bootstrap_file"; then
     run_as_aaas sed -i "s|__PLATFORM_DIR__|${PLATFORM_DIR}|g" "$bootstrap_file"
     ok "Resolved __PLATFORM_DIR__ in .hermes/config.yaml (staging)."
-  fi
-
-  if grep -q '__HERMES_HOME__' "$bootstrap_file"; then
-    run_as_aaas sed -i "s|__HERMES_HOME__|${AAAS_HOME}/.hermes|g" "$bootstrap_file"
-    ok "Resolved __HERMES_HOME__ in .hermes/config.yaml (staging)."
   fi
 }
 
