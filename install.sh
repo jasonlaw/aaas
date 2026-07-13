@@ -1061,6 +1061,64 @@ ensure_venv_ensurepip_support() {
 }
 
 # ---------------------------------------------------------------------------
+# bootstrap_mnemosyne_into_hermes_venv — install mnemosyne-hermes into
+# Hermes's own uv-managed venv, the way its externally-managed-environment
+# error itself instructs: via `uv pip install --python <hermes-python>
+# --break-system-packages`, not a plain pip install.
+#
+# Idempotent: skips entirely if the import already succeeds from Hermes's
+# python interpreter.
+# ---------------------------------------------------------------------------
+bootstrap_mnemosyne_into_hermes_venv() {
+  local profile="$1"
+  local hermes_python
+
+  # Resolve Hermes's own interpreter (the uv-built one, not the standalone
+  # mnemosyne venv) directly from the running hermes binary.
+  hermes_python="$(run_as_aaas bash -li -c \
+    "hermes --python-path 2>/dev/null || true")"
+
+  if [[ -z "$hermes_python" || ! -x "$hermes_python" ]]; then
+    # Fall back to deriving it the same way the auto-bootstrap error showed:
+    # the venv sitting alongside hermes's uv toolchain.
+    hermes_python="$(run_as_aaas bash -li -c \
+      'python3 -c "import sys; print(sys.executable)"' 2>/dev/null || true)"
+  fi
+
+  [[ -n "$hermes_python" && -x "$hermes_python" ]] \
+    || fail "Could not resolve Hermes's own python interpreter to bootstrap mnemosyne-hermes into it."
+
+  if run_as_aaas "$hermes_python" -c "import mnemosyne_hermes" >/dev/null 2>&1; then
+    ok "mnemosyne-hermes already importable from Hermes's own interpreter (${hermes_python}); skipping bootstrap."
+    return
+  fi
+
+  local pkg
+  if [[ -n "$profile" ]]; then
+    pkg="mnemosyne-hermes[${profile}]"
+  else
+    pkg="mnemosyne-hermes[all]"
+  fi
+
+  install_banner "mnemosyne-hermes bootstrap into Hermes venv"
+
+  if have uv || run_as_aaas bash -li -c "command -v uv >/dev/null 2>&1"; then
+    run_as_aaas bash -li -c "uv pip install --python '${hermes_python}' --break-system-packages -U '${pkg}'" \
+      || fail "uv pip install of ${pkg} into Hermes's venv (${hermes_python}) failed."
+  else
+    # No uv on PATH for aaas — fall back to the interpreter's own pip with
+    # the same override flag the error message calls for.
+    run_as_aaas "$hermes_python" -m pip install --quiet --upgrade --break-system-packages "$pkg" \
+      || fail "pip install --break-system-packages of ${pkg} into Hermes's venv (${hermes_python}) failed."
+  fi
+
+  run_as_aaas "$hermes_python" -c "import mnemosyne_hermes" >/dev/null 2>&1 \
+    || fail "mnemosyne-hermes still not importable from ${hermes_python} after bootstrap install."
+
+  ok "mnemosyne-hermes is now importable from Hermes's own interpreter (${hermes_python})."
+}
+
+# ---------------------------------------------------------------------------
 # Install Mnemosyne as Hermes's sole memory provider.
 #
 # Canonical method per https://docs.mnemosyne.site/api/hermes-plugin:
@@ -1173,7 +1231,23 @@ install_mnemosyne() {
   fi
 
   # ------------------------------------------------------------------
-  # 3. Register the plugin with Hermes using mnemosyne-hermes's own
+  # 3. Bootstrap mnemosyne-hermes into Hermes's OWN venv first.
+  #
+  #    Hermes's venv (AAAS_HOME/.hermes/hermes-agent/venv, built by uv)
+  #    is a PEP 668 externally-managed environment. mnemosyne-hermes's
+  #    own "install --force" tries to auto-bootstrap into it with a
+  #    plain pip install and no --break-system-packages, which always
+  #    fails there with "externally-managed-environment" — the error's
+  #    own hint says to use `uv pip install --python ... --break-system-
+  #    packages` instead. So we do that bootstrap ourselves, up front,
+  #    idempotently, and only then call mnemosyne-hermes install --force
+  #    to do the actual plugin registration (which at that point finds
+  #    the import already satisfied and skips its broken auto-bootstrap).
+  # ------------------------------------------------------------------
+  bootstrap_mnemosyne_into_hermes_venv "$profile"
+
+  # ------------------------------------------------------------------
+  # 4. Register the plugin with Hermes using mnemosyne-hermes's own
   #    installer, run from the standalone venv. This is the documented
   #    registration path and is safe to rerun via --force, so it
   #    replaces the previous manual symlink-into-~/.hermes/plugins/
@@ -1183,7 +1257,7 @@ install_mnemosyne() {
   ok "Registered the mnemosyne plugin with Hermes (mnemosyne-hermes install --force)."
 
   # ------------------------------------------------------------------
-  # 4. Register mnemosyne as the active memory provider.
+  # 5. Register mnemosyne as the active memory provider.
   #    `hermes config set` writes memory.provider: mnemosyne into
   #    ~/.hermes/config.yaml without requiring an interactive session.
   # ------------------------------------------------------------------
@@ -1191,7 +1265,7 @@ install_mnemosyne() {
   ok "memory.provider set to mnemosyne in Hermes config."
 
   # ------------------------------------------------------------------
-  # 5. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
+  # 6. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
   #    This routes Mnemosyne's consolidation and fact-extraction LLM
   #    calls through Hermes's own authenticated provider, so no
   #    separate API key is needed for memory operations.
