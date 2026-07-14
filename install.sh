@@ -1559,7 +1559,13 @@ alert() {
   printf "[%s] %s\n" "$(stamp)" "$*" >"${alert_path}/alert.txt"
   log "$*"
   if command -v opencode >/dev/null 2>&1; then
-    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. This matches the hermes-gateway-recovery skill under .opencode/skills — follow it to restart the gateway (sudo systemctl restart \"\$HERMES_GATEWAY_UNIT\", reading HERMES_GATEWAY_UNIT from ${CONFIG_FILE}). Inspect ${alert_path}/alert.txt first, then repair the gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
+    # HERMES_GATEWAY_UNIT is already sourced into this process's environment
+    # from CONFIG_FILE above — interpolate the resolved value directly into
+    # the prompt instead of telling opencode to go read the env file itself.
+    # opencode's sandbox auto-rejects reads of .env files by default, so
+    # asking it to open watchdog/.env to look up this value fails permission
+    # checks; passing the value inline avoids that read entirely.
+    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. This matches the hermes-gateway-recovery skill under .opencode/skills — follow it to restart the gateway: sudo systemctl restart \"${HERMES_GATEWAY_UNIT}\". Inspect ${alert_path}/alert.txt first, then repair the gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 

@@ -15,7 +15,7 @@
 # @force
 skills:
   external_dirs:
-    - __PLATFORM_DIR__/.opencode/skills
+    - __PLATFORM_DIR__/.agents/skills
     - __PLATFORM_DIR__/.hermes/skills
 
 # Mnemosyne is the sole memory provider. memory_enabled and user_profile_enabled
@@ -32,3 +32,10 @@ memory:
   memory_char_limit: 200
   user_char_limit: 200
   provider: mnemosyne
+
+# @default
+gateway:
+  enabled: true
+  platforms:
+    telegram:
+      enabled: true
