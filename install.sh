@@ -1828,10 +1828,7 @@ verify_hermes_runtime() {
     [[ -n "$unit_name" ]] || fail "Could not resolve the Hermes gateway systemd unit name after install."
     persist_hermes_gateway_unit "$unit_name"
     ensure_watchdog_systemctl_sudo "$unit_name"
-<<<<<<< HEAD
     resolve_late_bound_gateway_unit_placeholder "$unit_name"
-=======
->>>>>>> 2591eb34172a51e245596bbc65e9c7483715fd29
 
     # Health-check and start/restart via systemctl directly, not the hermes
     # CLI — see persist_hermes_gateway_unit's docstring for why.
