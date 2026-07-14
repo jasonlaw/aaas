@@ -932,19 +932,23 @@ WRAPPER
 # ensure_watchdog_sudo — grant aaas a narrowly-scoped, passwordless sudo
 # rule to run ONLY "$HERMES_REAL_BIN gateway ..." as root.
 #
-# Why this exists: the hermes gateway --system subcommands require root
-# (systemd unit control), but the watchdog service runs as aaas (least
-# privilege, matches every other AaaS process). Without this grant, the
-# watchdog's remedial "gateway start --system" call fails with
-# "requires root, re-run with sudo" every single time it tries to recover
-# a downed gateway — silently defeating the whole point of the watchdog.
+# NOTE: this grant is now used for diagnostics only (e.g. `hermes gateway
+# status --system` for richer application-level health info beyond "is the
+# process running"). The actual restart/health-check path used by
+# watchdog.sh, the opencode recovery skill, and summary() has moved to
+# systemctl directly — see ensure_watchdog_systemctl_sudo and
+# persist_hermes_gateway_unit's docstring for why: the hermes CLI's own
+# guard wrapper (blocks non-aaas) and the --system subcommands' root
+# requirement can never both be satisfied by one process, which produced
+# a real ping-pong failure in practice ("must run as aaas" <-> "requires
+# root", no matter how the command was invoked).
 #
 # The rule is scoped to the exact resolved binary path plus a literal
 # "gateway" subcommand — not a general NOPASSWD grant for aaas — so a
 # compromised watchdog process can't sudo anything else.
 # ---------------------------------------------------------------------------
 ensure_watchdog_sudo() {
-  step "Granting scoped sudo for Hermes gateway control"
+  step "Granting scoped sudo for Hermes gateway control (diagnostics)"
 
   [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before ensure_watchdog_sudo."
   [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Granting sudo rules requires root or sudo."
@@ -972,7 +976,58 @@ ensure_watchdog_sudo() {
   run $SUDO install -m 0440 -o root -g root "$tmp_sudoers" "$sudoers_file"
   rm -f "$tmp_sudoers"
   ok "Installed scoped sudoers rule at ${sudoers_file}."
-  ok "aaas may now run: sudo ${HERMES_REAL_BIN} gateway <start|stop|restart|status> --system (NOPASSWD)."
+  ok "aaas may now run: sudo ${HERMES_REAL_BIN} gateway <start|stop|restart|status> --system (NOPASSWD, diagnostics only)."
+}
+
+# ---------------------------------------------------------------------------
+# ensure_watchdog_systemctl_sudo — grant aaas a narrowly-scoped, passwordless
+# sudo rule to run ONLY `systemctl {start,stop,restart,is-active,status}
+# <exact-unit-name>` as root. This is the PRIMARY mechanism watchdog.sh,
+# the opencode recovery skill, and summary() all use to control the Hermes
+# gateway service — see persist_hermes_gateway_unit's docstring for the
+# real operational failure (a root-vs-aaas ping-pong through the hermes
+# CLI's own guard wrapper) that led to switching from `hermes gateway ...
+# --system` to plain systemctl for this.
+#
+# Scoped to the exact unit name (not a wildcard like "hermes*") so a
+# compromised watchdog process can't restart/stop arbitrary services.
+# Must be called only after the unit name is known (i.e. after
+# `hermes gateway install --system` has actually created it).
+# ---------------------------------------------------------------------------
+ensure_watchdog_systemctl_sudo() {
+  local unit_name="$1"
+  step "Granting scoped sudo for systemctl control of ${unit_name}"
+
+  [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Granting sudo rules requires root or sudo."
+  have visudo || fail "visudo is required to safely install the watchdog sudoers rule."
+
+  local systemctl_bin
+  systemctl_bin="$(command -v systemctl)"
+  [[ -n "$systemctl_bin" ]] || fail "Could not resolve the systemctl binary path."
+
+  local sudoers_file="/etc/sudoers.d/aaas-hermes-gateway-systemctl"
+  local rule="${AAAS_USER} ALL=(root) NOPASSWD: ${systemctl_bin} start ${unit_name}, ${systemctl_bin} stop ${unit_name}, ${systemctl_bin} restart ${unit_name}, ${systemctl_bin} status ${unit_name}, ${systemctl_bin} is-active ${unit_name}"
+  local tmp_sudoers
+  tmp_sudoers="$(mktemp)"
+
+  if [[ -f "$sudoers_file" ]] && grep -Fxq "$rule" "$sudoers_file" 2>/dev/null; then
+    ok "Sudoers rule already present and matches the current gateway unit name."
+    rm -f "$tmp_sudoers"
+    return
+  fi
+
+  printf '%s\n' "$rule" >"$tmp_sudoers"
+  chmod 0440 "$tmp_sudoers"
+
+  if ! $SUDO visudo -cf "$tmp_sudoers" >/dev/null 2>&1; then
+    rm -f "$tmp_sudoers"
+    fail "Generated sudoers rule failed visudo syntax check; not installed."
+  fi
+
+  run $SUDO install -m 0440 -o root -g root "$tmp_sudoers" "$sudoers_file"
+  rm -f "$tmp_sudoers"
+  ok "Installed scoped sudoers rule at ${sudoers_file}."
+  ok "aaas may now run: sudo systemctl <start|stop|restart|status|is-active> ${unit_name} (NOPASSWD)."
 }
 
 # Applies PLATFORM_DIR/.hermes/config.yaml onto the config.yaml produced by
@@ -1425,8 +1480,9 @@ write_watchdog() {
 
   # Watchdog script runs as the aaas user (enforced by the systemd unit).
   # No sudo needed inside for file ops: aaas owns every file it touches.
-  # Gateway --system operations DO need sudo (see ensure_watchdog_sudo()
-  # for the scoped NOPASSWD grant that makes this work non-interactively).
+  # systemctl start/restart/is-active on the Hermes gateway unit DO need
+  # sudo (see ensure_watchdog_systemctl_sudo() for the scoped NOPASSWD
+  # grant that makes this work non-interactively).
   run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.sh'" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -1455,7 +1511,7 @@ alert() {
   printf "[%s] %s\n" "$(stamp)" "$*" >"${alert_path}/alert.txt"
   log "$*"
   if command -v opencode >/dev/null 2>&1; then
-    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. This matches the hermes-gateway-recovery skill under .opencode/skills — follow it to restart the gateway (sudo \"\$HERMES_REAL_BIN\" gateway start --system, reading HERMES_REAL_BIN from ${CONFIG_FILE}). Inspect ${alert_path}/alert.txt first, then repair the gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
+    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. This matches the hermes-gateway-recovery skill under .opencode/skills — follow it to restart the gateway (sudo systemctl restart \"\$HERMES_GATEWAY_UNIT\", reading HERMES_GATEWAY_UNIT from ${CONFIG_FILE}). Inspect ${alert_path}/alert.txt first, then repair the gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -1463,35 +1519,37 @@ process_running() {
   pgrep -f "$1" >/dev/null 2>&1
 }
 
-# HERMES_REAL_BIN is written into CONFIG_FILE by install.sh's
-# ensure_hermes_wrapper(); it points at the actual hermes binary, not the
-# /usr/local/bin/hermes guard wrapper. --system gateway operations need
-# root, which the wrapper deliberately refuses to anyone (aaas included)
-# without going through sudo — so this script always calls
-# "$HERMES_REAL_BIN" via sudo, never the wrapper, for gateway commands.
-# The matching NOPASSWD sudoers grant is installed by
-# ensure_watchdog_sudo() in install.sh, scoped to exactly this binary
-# path plus the literal "gateway" subcommand.
-if [[ -z "${HERMES_REAL_BIN:-}" ]]; then
-  alert "HERMES_REAL_BIN is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
+# HERMES_GATEWAY_UNIT is written into CONFIG_FILE by install.sh's
+# persist_hermes_gateway_unit(); it's the exact systemd unit name that
+# `hermes gateway install --system` generated. We control it via plain
+# systemctl, NOT the `hermes` CLI — the hermes CLI's own guard wrapper
+# (/usr/local/bin/hermes, blocks anyone who isn't aaas) and the --system
+# subcommands' root requirement can never both be satisfied by a single
+# process, which produced a real, reproducible ping-pong failure in
+# practice: `hermes gateway restart` -> blocked (not aaas) ->
+# `sudo hermes gateway restart` -> blocked by the wrapper (root isn't
+# aaas) -> `sudo -u aaas hermes gateway restart` -> passes the wrapper,
+# but aaas isn't root, so the systemd-control step itself then fails.
+# systemctl sidesteps this entirely: the unit's own User=aaas directive
+# execs the process as aaas at the OS level, never touching the wrapper
+# or the hermes CLI's own logic at all. The matching NOPASSWD sudoers
+# grant is installed by ensure_watchdog_systemctl_sudo() in install.sh,
+# scoped to exactly this unit name.
+if [[ -z "${HERMES_GATEWAY_UNIT:-}" ]]; then
+  alert "HERMES_GATEWAY_UNIT is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
   exit 1
 fi
 
-if [[ ! -x "$HERMES_REAL_BIN" ]]; then
-  alert "HERMES_REAL_BIN (${HERMES_REAL_BIN}) is not executable; Hermes may have been reinstalled at a new path"
-  exit 1
-fi
-
-if sudo -n "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
+if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
   log "Hermes gateway system service is healthy."
   exit 0
 fi
 
 log "Hermes gateway system service is not healthy; attempting restart."
-if sudo -n "$HERMES_REAL_BIN" gateway start --system >>"$LOG_FILE" 2>&1; then
+if sudo -n systemctl restart "$HERMES_GATEWAY_UNIT" >>"$LOG_FILE" 2>&1; then
   sleep 3
-  if sudo -n "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
-    log "Hermes gateway system service recovered via gateway start --system."
+  if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
+    log "Hermes gateway system service recovered via systemctl restart."
     exit 0
   fi
 fi
@@ -1499,7 +1557,7 @@ fi
 # The direct restart attempt failed or didn't stick — hand off to opencode,
 # which follows the hermes-gateway-recovery skill for further remediation
 # (log inspection, container/docker checks, etc.) rather than looping here.
-alert "Hermes gateway system service failed to start via 'sudo \"$HERMES_REAL_BIN\" gateway start --system'"
+alert "Hermes gateway system service failed to start via 'sudo systemctl restart \"$HERMES_GATEWAY_UNIT\"'"
 exit 1
 EOF
 
@@ -1632,10 +1690,20 @@ resolve_platform_placeholders() {
   run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$PLATFORM_DIR"
 }
 
+# ---------------------------------------------------------------------------
+# resolve_hermes_gateway_unit_name — find the systemd unit name that
+# `hermes gateway install --system` generated. Factored out since both
+# configure_hermes_gateway_service_env and verify_hermes_runtime need it.
+# ---------------------------------------------------------------------------
+resolve_hermes_gateway_unit_name() {
+  $SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+    | awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }'
+}
+
 configure_hermes_gateway_service_env() {
   local unit_name dropin_dir dropin_file
 
-  unit_name="$($SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }')"
+  unit_name="$(resolve_hermes_gateway_unit_name)"
 
   if [[ -z "$unit_name" ]]; then
     warn "Could not find the installed Hermes gateway systemd unit. It may need a manual service override."
@@ -1654,6 +1722,41 @@ configure_hermes_gateway_service_env() {
     | $SUDO tee "$dropin_file" >/dev/null
   run $SUDO systemctl daemon-reload
   ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP}."
+}
+
+# ---------------------------------------------------------------------------
+# persist_hermes_gateway_unit — write HERMES_GATEWAY_UNIT into CONFIG_FILE
+# so watchdog.sh, the opencode recovery skill, and summary() can all
+# reference the resolved unit name directly via `systemctl <verb> <unit>`,
+# without re-discovering it or going through the `hermes` CLI/guard wrapper.
+#
+# Why systemctl, not the hermes CLI, for restart/health-check: the guard
+# wrapper at /usr/local/bin/hermes blocks anyone who isn't aaas, but
+# --system gateway control needs root — a single process can never satisfy
+# both simultaneously. In practice this produces exactly the ping-pong
+# reported against a live deployment: `hermes gateway restart` (blocked,
+# not aaas) -> `sudo hermes gateway restart` (blocked by wrapper, root
+# isn't aaas) -> `sudo -u aaas hermes gateway restart` (passes the wrapper,
+# but aaas isn't root, so the systemd-control step itself then fails).
+# `sudo systemctl restart <unit>` sidesteps all of this: systemd's own
+# User=aaas directive in the unit (see configure_hermes_gateway_service_env)
+# execs the process as aaas at the OS level, never touching the wrapper or
+# the hermes CLI's own logic at all — confirmed as the reliable path in
+# practice, and now the primary mechanism used throughout install.sh.
+# ---------------------------------------------------------------------------
+persist_hermes_gateway_unit() {
+  local unit_name="$1"
+
+  # Idempotent: replace any existing HERMES_GATEWAY_UNIT line rather than
+  # appending a duplicate on rerun.
+  if grep -q '^HERMES_GATEWAY_UNIT=' "$CONFIG_FILE" 2>/dev/null; then
+    run_as_aaas sed -i "s|^HERMES_GATEWAY_UNIT=.*|HERMES_GATEWAY_UNIT=${unit_name}|" "$CONFIG_FILE"
+  else
+    printf "HERMES_GATEWAY_UNIT=%s\n" "$unit_name" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
+  fi
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$CONFIG_FILE"
+  run $SUDO chmod 660 "$CONFIG_FILE"
+  ok "Persisted HERMES_GATEWAY_UNIT=${unit_name} to ${CONFIG_FILE}."
 }
 
 verify_hermes_runtime() {
@@ -1680,24 +1783,31 @@ verify_hermes_runtime() {
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
     [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
 
-    # All gateway operations need root (they control/query systemd) — use the
-    # real binary directly, bypassing the wrapper guard (which blocks non-aaas).
+    # gateway install itself still needs the real binary directly (it's a
+    # one-time setup/generation step, not the restart path this feedback
+    # is about) — bypassing the wrapper guard, which blocks non-aaas.
     run $SUDO "$HERMES_REAL_BIN" gateway install --system
     configure_hermes_gateway_service_env
 
-    # gateway install may have already started the service; only call start if
-    # it is not already running to avoid a non-zero exit on re-run.
-    if ! $SUDO "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
-      run $SUDO "$HERMES_REAL_BIN" gateway start --system
+    local unit_name
+    unit_name="$(resolve_hermes_gateway_unit_name)"
+    [[ -n "$unit_name" ]] || fail "Could not resolve the Hermes gateway systemd unit name after install."
+    persist_hermes_gateway_unit "$unit_name"
+    ensure_watchdog_systemctl_sudo "$unit_name"
+
+    # Health-check and start/restart via systemctl directly, not the hermes
+    # CLI — see persist_hermes_gateway_unit's docstring for why.
+    if ! $SUDO systemctl is-active --quiet "$unit_name"; then
+      run $SUDO systemctl start "$unit_name"
     else
       ok "Hermes gateway is already running."
     fi
 
-    if ! $SUDO "$HERMES_REAL_BIN" gateway status --system >/dev/null 2>&1; then
+    if ! $SUDO systemctl is-active --quiet "$unit_name"; then
       write_alert "Hermes gateway system service failed verification"
-      fail "Hermes gateway system service is not running. Check: sudo ${HERMES_REAL_BIN} gateway status --system"
+      fail "Hermes gateway system service is not running. Check: sudo systemctl status ${unit_name}"
     fi
-    ok "Hermes gateway system service is running as ${AAAS_USER}."
+    ok "Hermes gateway system service (${unit_name}) is running as ${AAAS_USER}."
   else
     if ! start_background_service "hermes.*gateway" hermes gateway; then
       write_alert "Hermes gateway failed to start"
@@ -1768,8 +1878,8 @@ summary() {
   printf "       ${BOLD}sudo -u %s hermes gateway setup${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  5. After any configuration change, restart the gateway to apply it:\n"
-  printf "       ${BOLD}sudo %s gateway restart --system${RESET}\n" "$HERMES_REAL_BIN"
-  printf "     (this exact path is also stored in %s as HERMES_REAL_BIN)\n" "$CONFIG_FILE"
+  printf "       ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT)"
+  printf "     (this exact unit name is also stored in %s as HERMES_GATEWAY_UNIT)\n" "$CONFIG_FILE"
   printf "\n"
   printf "  6. Mnemosyne install profile is controlled by MNEMOSYNE_INSTALL_PROFILE\n"
   printf "     (default: embeddings, ~800 MB, local semantic recall out of the box).\n"
@@ -1784,14 +1894,19 @@ summary() {
   printf "  suggesting a switch to a per-user service.\n"
   printf "\n"
   printf "%sManual gateway restarts:%s\n" "${BOLD}" "${RESET}"
-  printf "  The 'hermes' command on PATH is a guard wrapper that blocks non-%s users,\n" "$AAAS_USER"
-  printf "  including root. System-level gateway operations need root AND the real\n"
-  printf "  binary, bypassing the wrapper entirely. Use:\n"
-  printf "    ${BOLD}sudo %s gateway restart --system${RESET}\n" "$HERMES_REAL_BIN"
+  printf "  Use systemctl directly, NOT the 'hermes' CLI. The 'hermes' command on PATH\n"
+  printf "  is a guard wrapper that blocks anyone who isn't %s, including root — but\n" "$AAAS_USER"
+  printf "  gateway control needs root, and a single process can't be both at once.\n"
+  printf "  In practice this produces a real ping-pong: plain 'hermes gateway restart'\n"
+  printf "  is blocked (not %s); 'sudo hermes gateway restart' is blocked too (root\n" "$AAAS_USER"
+  printf "  isn't %s); 'sudo -u %s hermes gateway restart' passes the wrapper but then\n" "$AAAS_USER" "$AAAS_USER"
+  printf "  fails needing root. systemctl sidesteps all of this — the unit's own\n"
+  printf "  User=%s directive execs the process correctly at the OS level:\n" "$AAAS_USER"
+  printf "    ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT)"
   printf "  The watchdog service (aaas-watchdog.service) already does this automatically\n"
-  printf "  via a scoped NOPASSWD sudoers rule at /etc/sudoers.d/aaas-hermes-gateway, and\n"
-  printf "  falls back to invoking opencode with the hermes-gateway-recovery skill if the\n"
-  printf "  direct restart attempt fails.\n"
+  printf "  via a scoped NOPASSWD sudoers rule at /etc/sudoers.d/aaas-hermes-gateway-systemctl,\n"
+  printf "  and falls back to invoking opencode with the hermes-gateway-recovery skill if\n"
+  printf "  the direct restart attempt fails.\n"
 }
 
 main() {
