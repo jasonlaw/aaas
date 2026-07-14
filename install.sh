@@ -273,7 +273,7 @@ config_value() {
   local file="${2:-$CONFIG_FILE}"
 
   [[ -f "$file" ]] || return 0
-  grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2-
+  grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2- || true
 }
 
 yaml_quote() {
@@ -1967,7 +1967,7 @@ summary() {
   printf "  isn't %s); 'sudo -u %s hermes gateway restart' passes the wrapper but then\n" "$AAAS_USER" "$AAAS_USER"
   printf "  fails needing root. systemctl sidesteps all of this — the unit's own\n"
   printf "  User=%s directive execs the process correctly at the OS level:\n" "$AAAS_USER"
-  printf "    ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT)"
+  printf "    ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT "$WATCHDOG_ENV_FILE")"
   printf "  The watchdog service (aaas-watchdog.service) already does this automatically\n"
   printf "  via a scoped NOPASSWD sudoers rule at /etc/sudoers.d/aaas-hermes-gateway-systemctl,\n"
   printf "  and falls back to invoking opencode with the hermes-gateway-recovery skill if\n"
