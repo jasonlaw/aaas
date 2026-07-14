@@ -27,7 +27,7 @@ The Hermes gateway systemd unit on this deployment is:
 
     __HERMES_GATEWAY_UNIT__
 
-(also stored in __CONFIG_FILE__ as HERMES_GATEWAY_UNIT, in case install.sh
+(also stored in __WATCHDOG_ENV_FILE__ as HERMES_GATEWAY_UNIT, in case install.sh
 is rerun and regenerates this value — if so, this skill file gets
 re-resolved too, so treat this file, not memory, as the source of truth).
 

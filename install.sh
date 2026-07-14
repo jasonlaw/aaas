@@ -10,11 +10,21 @@ fi
 ROOT_DIR="${AAAS_ROOT:-/opt/aaas}"
 PLATFORM_DIR="${ROOT_DIR}/platform"
 WATCHDOG_DIR="${PLATFORM_DIR}/watchdog"
-# Platform-owned env file consumed by watchdog.sh and the systemd units.
-# Deliberately lives outside Hermes's own directory (AAAS_HOME/.hermes):
-# install.sh must never write into that directory, since that's where
-# `hermes setup` later stores real provider config and secrets.
+# Platform-owned env file. General bootstrap values only (AAAS_ROOT,
+# HERMES_REAL_BIN) — consumed by install.sh itself on reruns via
+# config_value(). Deliberately lives outside Hermes's own directory
+# (AAAS_HOME/.hermes): install.sh must never write into that directory,
+# since that's where `hermes setup` later stores real provider config and
+# secrets. This file is NOT wired into any systemd unit's EnvironmentFile=
+# — the Hermes gateway unit finds ~/.hermes/.env on its own via User=aaas,
+# and the watchdog has its own separate env file (WATCHDOG_ENV_FILE below).
+# Neither copies values from the other.
 CONFIG_FILE="${PLATFORM_DIR}/.env"
+# Watchdog-owned env file. Holds only what watchdog.sh/watchdog.service
+# need (currently just HERMES_GATEWAY_UNIT). Deliberately separate from
+# CONFIG_FILE and from Hermes's own ~/.hermes/.env — the watchdog never
+# reads Hermes's config and Hermes never reads the watchdog's.
+WATCHDOG_ENV_FILE="${WATCHDOG_DIR}/.env"
 AAAS_REPO_URL="${AAAS_REPO_URL:-https://github.com/jasonlaw/aaas.git}"
 AAAS_REPO_REF="${AAAS_REPO_REF:-master}"
 HERMES_OFFICIAL_INSTALL_URL="${HERMES_OFFICIAL_INSTALL_URL:-https://hermes-agent.nousresearch.com/install.sh}"
@@ -260,9 +270,10 @@ install_banner() {
 
 config_value() {
   local key="$1"
+  local file="${2:-$CONFIG_FILE}"
 
-  [[ -f "$CONFIG_FILE" ]] || return 0
-  grep -E "^${key}=" "$CONFIG_FILE" | tail -n 1 | cut -d= -f2-
+  [[ -f "$file" ]] || return 0
+  grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2-
 }
 
 yaml_quote() {
@@ -783,6 +794,7 @@ build_bootstrap_placeholder_table() {
     ["__AAAS_GROUP__"]="$AAAS_GROUP"
     ["__CONFIG_FILE__"]="$CONFIG_FILE"
     ["__WATCHDOG_DIR__"]="$WATCHDOG_DIR"
+    ["__WATCHDOG_ENV_FILE__"]="$WATCHDOG_ENV_FILE"
     ["__ALERT_DIR__"]="$ALERT_DIR"
   )
 }
@@ -1523,7 +1535,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLATFORM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_FILE="${PLATFORM_DIR}/.env"
+# Watchdog's own env file, separate from the platform .env and from
+# Hermes's ~/.hermes/.env. Currently holds only HERMES_GATEWAY_UNIT.
+CONFIG_FILE="${SCRIPT_DIR}/.env"
 ALERT_DIR="${SCRIPT_DIR}/alerts"
 LOG_FILE="${SCRIPT_DIR}/watchdog.log"
 
@@ -1609,7 +1623,7 @@ Wants=network-online.target
 Type=simple
 User=${AAAS_USER}
 Group=${AAAS_GROUP}
-EnvironmentFile=${CONFIG_FILE}
+EnvironmentFile=${WATCHDOG_ENV_FILE}
 ExecStart=${WATCHDOG_DIR}/watchdog.sh
 Restart=always
 RestartSec=20
@@ -1655,6 +1669,7 @@ init_platform_placeholders() {
     [__ROOT_DIR__]="$ROOT_DIR"
     [__CONFIG_FILE__]="$CONFIG_FILE"
     [__WATCHDOG_DIR__]="$WATCHDOG_DIR"
+    [__WATCHDOG_ENV_FILE__]="$WATCHDOG_ENV_FILE"
     [__ALERT_DIR__]="$ALERT_DIR"
   )
 }
@@ -1749,20 +1764,25 @@ configure_hermes_gateway_service_env() {
 
   run $SUDO mkdir -p "$dropin_dir"
   # Run the gateway as aaas:aaas. With User=aaas set, systemd resolves $HOME
-  # from /etc/passwd automatically, so Hermes finds its config at its own
-  # default location without any extra environment variables.
-  printf "[Service]\nUser=%s\nGroup=%s\nEnvironmentFile=%s\n" \
-    "$AAAS_USER" "$AAAS_GROUP" "$CONFIG_FILE" \
+  # from /etc/passwd automatically, so Hermes finds ~/.hermes/.env at its
+  # own default location without any extra environment variables. Do NOT
+  # add an EnvironmentFile= here: neither the platform .env nor the
+  # watchdog's env file belong in the gateway's process environment —
+  # Hermes reads its own .env directly, and always should.
+  printf "[Service]\nUser=%s\nGroup=%s\n" \
+    "$AAAS_USER" "$AAAS_GROUP" \
     | $SUDO tee "$dropin_file" >/dev/null
   run $SUDO systemctl daemon-reload
-  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP}."
+  ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} (reads its own ~/.hermes/.env; no EnvironmentFile override)."
 }
 
 # ---------------------------------------------------------------------------
-# persist_hermes_gateway_unit — write HERMES_GATEWAY_UNIT into CONFIG_FILE
-# so watchdog.sh, the opencode recovery skill, and summary() can all
-# reference the resolved unit name directly via `systemctl <verb> <unit>`,
-# without re-discovering it or going through the `hermes` CLI/guard wrapper.
+# persist_hermes_gateway_unit — write HERMES_GATEWAY_UNIT into
+# WATCHDOG_ENV_FILE (the watchdog's own env file, not the platform
+# CONFIG_FILE and not Hermes's ~/.hermes/.env) so watchdog.sh, the opencode
+# recovery skill, and summary() can all reference the resolved unit name
+# directly via `systemctl <verb> <unit>`, without re-discovering it or
+# going through the `hermes` CLI/guard wrapper.
 #
 # Why systemctl, not the hermes CLI, for restart/health-check: the guard
 # wrapper at /usr/local/bin/hermes blocks anyone who isn't aaas, but
@@ -1781,16 +1801,26 @@ configure_hermes_gateway_service_env() {
 persist_hermes_gateway_unit() {
   local unit_name="$1"
 
+  # Ensure the watchdog's own env file exists before writing to it — it's
+  # never pre-created elsewhere, unlike the platform CONFIG_FILE.
+  if [[ ! -f "$WATCHDOG_ENV_FILE" ]]; then
+    run_as_aaas bash -c "cat > '${WATCHDOG_ENV_FILE}'" <<EOF
+# Generated by install.sh — watchdog-only settings.
+# Deliberately separate from ${CONFIG_FILE} and from Hermes's own
+# ~/.hermes/.env. Nothing here is copied to or from either of those.
+EOF
+  fi
+
   # Idempotent: replace any existing HERMES_GATEWAY_UNIT line rather than
   # appending a duplicate on rerun.
-  if grep -q '^HERMES_GATEWAY_UNIT=' "$CONFIG_FILE" 2>/dev/null; then
-    run_as_aaas sed -i "s|^HERMES_GATEWAY_UNIT=.*|HERMES_GATEWAY_UNIT=${unit_name}|" "$CONFIG_FILE"
+  if grep -q '^HERMES_GATEWAY_UNIT=' "$WATCHDOG_ENV_FILE" 2>/dev/null; then
+    run_as_aaas sed -i "s|^HERMES_GATEWAY_UNIT=.*|HERMES_GATEWAY_UNIT=${unit_name}|" "$WATCHDOG_ENV_FILE"
   else
-    printf "HERMES_GATEWAY_UNIT=%s\n" "$unit_name" | run_as_aaas tee -a "$CONFIG_FILE" >/dev/null
+    printf "HERMES_GATEWAY_UNIT=%s\n" "$unit_name" | run_as_aaas tee -a "$WATCHDOG_ENV_FILE" >/dev/null
   fi
-  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$CONFIG_FILE"
-  run $SUDO chmod 660 "$CONFIG_FILE"
-  ok "Persisted HERMES_GATEWAY_UNIT=${unit_name} to ${CONFIG_FILE}."
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$WATCHDOG_ENV_FILE"
+  run $SUDO chmod 660 "$WATCHDOG_ENV_FILE"
+  ok "Persisted HERMES_GATEWAY_UNIT=${unit_name} to ${WATCHDOG_ENV_FILE}."
 }
 
 verify_hermes_runtime() {
@@ -1913,8 +1943,8 @@ summary() {
   printf "       ${BOLD}sudo -u %s hermes gateway setup${RESET}\n" "$AAAS_USER"
   printf "\n"
   printf "  5. After any configuration change, restart the gateway to apply it:\n"
-  printf "       ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT)"
-  printf "     (this exact unit name is also stored in %s as HERMES_GATEWAY_UNIT)\n" "$CONFIG_FILE"
+  printf "       ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT "$WATCHDOG_ENV_FILE")"
+  printf "     (this exact unit name is also stored in %s as HERMES_GATEWAY_UNIT)\n" "$WATCHDOG_ENV_FILE"
   printf "\n"
   printf "  6. Mnemosyne install profile is controlled by MNEMOSYNE_INSTALL_PROFILE\n"
   printf "     (default: embeddings, ~800 MB, local semantic recall out of the box).\n"

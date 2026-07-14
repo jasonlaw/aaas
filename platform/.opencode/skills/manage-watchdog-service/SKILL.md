@@ -1,6 +1,6 @@
 ---
 name: manage-watchdog-service
-description: Start, stop, restart, or check the status of the AaaS Hermes watchdog (aaas-watchdog.service). Use whenever the user wants to control the watchdog daemon that keeps the Hermes gateway alive, check whether it's currently running, review unresolved watchdog alerts, or restart it after changing HERMES_HOME or .hermes/.env. Trigger on phrases like "start/stop/restart the watchdog", "is the watchdog running", "check watchdog status", or "watchdog alerts".
+description: Start, stop, restart, or check the status of the AaaS Hermes watchdog (aaas-watchdog.service). Use whenever the user wants to control the watchdog daemon that keeps the Hermes gateway alive, check whether it's currently running, review unresolved watchdog alerts, or restart it after changing watchdog/.env. Trigger on phrases like "start/stop/restart the watchdog", "is the watchdog running", "check watchdog status", or "watchdog alerts".
 ---
 
 # Manage Watchdog Service
@@ -24,7 +24,7 @@ loop. There is no long-lived `watchdog.sh` process to `pgrep` for — checking
 - Script: `<watchdog_dir>/watchdog.sh`
 - Log: `<watchdog_dir>/watchdog.log`
 - Alerts: `<watchdog_dir>/alerts/alert-<timestamp>-<pid>/alert.txt`
-- Config sourced by watchdog.sh: `<platform_dir>/.hermes/.env` (`HERMES_HOME`, `AAAS_ROOT`)
+- Config sourced by watchdog.sh: `<platform_dir>/watchdog/.env` (its own file — currently just `HERMES_GATEWAY_UNIT`; separate from Hermes's `~/.hermes/.env` and from the platform's `<platform_dir>/.env`)
 - systemd unit: `aaas-watchdog.service` (installed to `/etc/systemd/system/`)
 
 ## Preconditions
@@ -86,7 +86,7 @@ sudo systemctl is-active --quiet aaas-watchdog.service && echo started
 
 If it fails to become active, don't retry blindly — check
 `systemctl status aaas-watchdog.service --no-pager` and the log tail above
-for the reason first (commonly: `.hermes/.env` missing/unreadable, or
+for the reason first (commonly: `<platform_dir>/watchdog/.env` missing/unreadable, or
 `hermes` not resolvable at `/usr/local/bin/hermes`, which is the symlink
 `ensure_hermes_symlink` sets up during install).
 
@@ -107,9 +107,9 @@ longer notice or auto-restart the gateway if it goes down.
 sudo systemctl restart aaas-watchdog.service
 ```
 
-Use this after editing `<platform_dir>/.hermes/.env` (e.g. changed
-`HERMES_HOME`) — the unit's `EnvironmentFile=` is only read at start, so a
-plain `stop` + wait doesn't pick up edits; `restart` does.
+Use this after editing `<platform_dir>/watchdog/.env` (e.g. changed
+`HERMES_GATEWAY_UNIT`) — the unit's `EnvironmentFile=` is only read at
+start, so a plain `stop` + wait doesn't pick up edits; `restart` does.
 
 ## What NOT to do here
 
