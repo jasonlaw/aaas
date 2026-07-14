@@ -1551,21 +1551,51 @@ log() {
   printf "[%s] %s\n" "$(stamp)" "$*" >>"$LOG_FILE"
 }
 
+# ---------------------------------------------------------------------------
+# alert <alert_code> <message> [key: value ...]
+#
+# Generic, target-agnostic alert dispatcher. Writes a structured alert.txt
+# into a unique timestamped folder and hands the folder off to opencode,
+# which routes to the matching "<alert_code>-recovery" skill via the
+# watchdog-alert skill. Any future watchdog check (docker engine, disk
+# space, mnemosyne reachability, etc.) reuses this same function — nothing
+# here is gateway-specific.
+#
+# alert_code must match the "<alert_code>-recovery" skill name under
+# .opencode/skills/ exactly (e.g. "hermes-gateway" -> hermes-gateway-recovery).
+#
+# Extra key/value pairs are optional, freeform context for the recovery
+# skill (e.g. "gateway_unit: hermes-gateway.service"). Each must already be
+# a single "key: value" line — this function does no quoting/escaping of
+# them, so callers should keep values simple (no embedded newlines/colons
+# in the key itself).
+# ---------------------------------------------------------------------------
 alert() {
-  local alert_path
+  local alert_code="$1"
+  local message="$2"
+  shift 2
+  local alert_path kv
 
   alert_path="${ALERT_DIR}/alert-$(date "+%Y%m%d-%H%M%S")-$$"
   mkdir -p "$alert_path"
-  printf "[%s] %s\n" "$(stamp)" "$*" >"${alert_path}/alert.txt"
-  log "$*"
+
+  {
+    printf "alert_code: %s\n" "$alert_code"
+    printf "timestamp_utc: %s\n" "$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
+    printf "message: %s\n" "$message"
+    for kv in "$@"; do
+      printf "%s\n" "$kv"
+    done
+  } >"${alert_path}/alert.txt"
+
+  log "[$alert_code] $message"
+
   if command -v opencode >/dev/null 2>&1; then
-    # HERMES_GATEWAY_UNIT is already sourced into this process's environment
-    # from CONFIG_FILE above — interpolate the resolved value directly into
-    # the prompt instead of telling opencode to go read the env file itself.
-    # opencode's sandbox auto-rejects reads of .env files by default, so
-    # asking it to open watchdog/.env to look up this value fails permission
-    # checks; passing the value inline avoids that read entirely.
-    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert: $*. This matches the hermes-gateway-recovery skill under .opencode/skills — follow it to restart the gateway: sudo systemctl restart \"${HERMES_GATEWAY_UNIT}\". Inspect ${alert_path}/alert.txt first, then repair the gateway, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
+    # The prompt deliberately carries no alert-specific detail at all — the
+    # watchdog-alert skill reads everything it needs (alert_code, message,
+    # and any extra fields) straight out of alert.txt. This keeps alert()
+    # itself, and this invocation, identical no matter what target failed.
+    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert. Alert folder: ${alert_path}. Use the watchdog-alert skill.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -1590,9 +1620,10 @@ process_running() {
 # grant is installed by ensure_watchdog_systemctl_sudo() in install.sh,
 # scoped to exactly this unit name.
 if [[ -z "${HERMES_GATEWAY_UNIT:-}" ]]; then
-  alert "HERMES_GATEWAY_UNIT is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
+  alert "hermes-gateway" "HERMES_GATEWAY_UNIT is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
   exit 1
 fi
+
 
 if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
   log "Hermes gateway system service is healthy."
@@ -1611,7 +1642,9 @@ fi
 # The direct restart attempt failed or didn't stick — hand off to opencode,
 # which follows the hermes-gateway-recovery skill for further remediation
 # (log inspection, container/docker checks, etc.) rather than looping here.
-alert "Hermes gateway system service failed to start via 'sudo systemctl restart \"$HERMES_GATEWAY_UNIT\"'"
+alert "hermes-gateway" \
+  "Hermes gateway system service failed to start via 'sudo systemctl restart \"$HERMES_GATEWAY_UNIT\"'" \
+  "gateway_unit: $HERMES_GATEWAY_UNIT"
 exit 1
 EOF
 
