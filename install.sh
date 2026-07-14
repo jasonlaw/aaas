@@ -1497,69 +1497,51 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# write_opencode_hermes_skill — give opencode an explicit, versioned skill
-# for Hermes gateway recovery, so the "invoke opencode" fallback path in
-# watchdog.sh's alert() doesn't have to rely on the model guessing the
+# write_opencode_hermes_skill — resolve placeholders in the
+# hermes-gateway-recovery skill so opencode's fallback recovery path (see
+# watchdog.sh's alert()) doesn't have to rely on the model guessing the
 # correct (sudo + real binary, not the wrapper) command each time.
+#
+# The skill's actual content lives directly in the repo at
+# platform/.opencode/skills/hermes-gateway-recovery/SKILL.md — sync_platform_files
+# already clones the whole platform/ tree as-is into PLATFORM_DIR, so this
+# file already exists at exactly the path it needs to live at runtime.
+# This function's only job is to resolve the __PLACEHOLDER__ tokens
+# (AAAS_USER, CONFIG_FILE, WATCHDOG_DIR, ALERT_DIR) in place, the same
+# way resolve_config_bootstrap_placeholders() does for config.yaml.
+#
+# Idempotent: uses a marker check so re-running install.sh against an
+# already-resolved file is a no-op rather than re-substituting into
+# already-resolved (placeholder-free) text.
 # ---------------------------------------------------------------------------
 write_opencode_hermes_skill() {
-  step "Writing opencode hermes-gateway-recovery skill"
+  step "Resolving opencode hermes-gateway-recovery skill placeholders"
 
-  local skill_dir="${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery"
+  local skill_file="${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery/SKILL.md"
 
-  run_as_aaas mkdir -p "$skill_dir"
-  run_as_aaas bash -c "cat > '${skill_dir}/SKILL.md'" <<EOF
-# Hermes Gateway Recovery
+  if [[ ! -f "$skill_file" ]]; then
+    warn "Skill file not found at ${skill_file}; skipping."
+    warn "Add platform/.opencode/skills/hermes-gateway-recovery/SKILL.md to the aaas repo to enable this."
+    return
+  fi
 
-Use this skill whenever an AaaS watchdog alert reports the Hermes gateway
-system service failed to start or is unhealthy.
+  if ! grep -qE '__AAAS_USER__|__CONFIG_FILE__|__WATCHDOG_DIR__|__ALERT_DIR__' "$skill_file"; then
+    ok "Skill placeholders already resolved; leaving ${skill_file} as-is."
+    run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$(dirname "$skill_file")"
+    return
+  fi
 
-## Why the obvious command fails
+  # sed's delimiter is | since the substituted values (paths) may
+  # themselves contain /.
+  run_as_aaas sed -i \
+    -e "s|__AAAS_USER__|${AAAS_USER}|g" \
+    -e "s|__CONFIG_FILE__|${CONFIG_FILE}|g" \
+    -e "s|__WATCHDOG_DIR__|${WATCHDOG_DIR}|g" \
+    -e "s|__ALERT_DIR__|${ALERT_DIR}|g" \
+    "$skill_file"
 
-The \`hermes\` command on PATH (/usr/local/bin/hermes) is a guard wrapper
-that refuses to run for anyone except the '${AAAS_USER}' user — including
-root. Running \`sudo hermes gateway ...\` therefore always fails with
-"hermes must be run as the '${AAAS_USER}' user", even as root, because the
-wrapper's own check runs first and blocks it.
-
-Separately, --system gateway operations require root, which the
-'${AAAS_USER}' user does not have on its own.
-
-## Correct recovery procedure
-
-1. Read \`HERMES_REAL_BIN\` from ${CONFIG_FILE} — this is the actual
-   hermes binary path, not the wrapper.
-2. Call it directly via sudo, bypassing the wrapper entirely:
-
-\`\`\`bash
-source ${CONFIG_FILE}
-sudo "\$HERMES_REAL_BIN" gateway status --system
-sudo "\$HERMES_REAL_BIN" gateway start --system
-# or, if it's already running but unhealthy:
-sudo "\$HERMES_REAL_BIN" gateway restart --system
-\`\`\`
-
-A scoped NOPASSWD sudoers rule for exactly "\$HERMES_REAL_BIN gateway *"
-is installed at /etc/sudoers.d/aaas-hermes-gateway, so these commands run
-non-interactively as '${AAAS_USER}' without a password prompt.
-
-3. If \`gateway start --system\` still fails after this:
-   - Check \`${WATCHDOG_DIR}/watchdog.log\` for the failure output.
-   - Check \`journalctl -u \$(systemctl list-unit-files --type=service --no-legend | awk '\$1 ~ /hermes/ && \$1 ~ /gateway/ {print \$1; exit}')\`
-     for the underlying systemd/service error.
-   - Check Docker is running (\`docker info\`) if Hermes's terminal backend
-     depends on it.
-   - Do NOT attempt to reinstall Hermes or edit the wrapper as a first
-     response — the wrapper and sudoers grant are intentional and correct;
-     the fix is almost always in the gateway process itself, not the
-     access-control layer around it.
-4. Report back what \`gateway status --system\` shows after recovery, and
-   note the outcome in the alert file under
-   \`${ALERT_DIR}/\` before removing it, so the audit trail is preserved.
-EOF
-
-  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$skill_dir"
-  ok "Wrote opencode skill: ${skill_dir}/SKILL.md"
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$(dirname "$skill_file")"
+  ok "Resolved placeholders in ${skill_file}."
 }
 
 configure_hermes_gateway_service_env() {

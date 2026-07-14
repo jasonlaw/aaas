@@ -12,7 +12,7 @@
 # file is synced onto the target host — neither can be known ahead of time:
 #   __PLATFORM_DIR__  →  ${AAAS_ROOT}/platform (AAAS_ROOT is configurable)
 
-
+# @force
 skills:
   external_dirs:
     - __PLATFORM_DIR__/.opencode/skills
@@ -25,6 +25,7 @@ skills:
 # the memory toolset gate (agent_init.py:1163-1172) is controlled separately by
 # `hermes tools enable/disable memory` — NOT by this config key.
 # Do NOT run `hermes tools disable memory` — that kills Mnemosyne tools too.
+# @force
 memory:
   memory_enabled: true
   user_profile_enabled: true
@@ -34,5 +35,7 @@ memory:
 
 
 # Left for `hermes setup` to configure interactively.
-#provider:
-#model:
+# @disable
+provider:
+# @disable
+model:
