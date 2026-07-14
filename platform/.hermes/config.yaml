@@ -32,10 +32,3 @@ memory:
   memory_char_limit: 200
   user_char_limit: 200
   provider: mnemosyne
-
-
-# Left for `hermes setup` to configure interactively.
-# @disable
-provider:
-# @disable
-model:

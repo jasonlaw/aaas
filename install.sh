@@ -736,6 +736,112 @@ install_docker() {
 #   - All files under Hermes's home (AAAS_HOME/.hermes) are owned by aaas
 #   - The binary lands in aaas's local path
 #   - Anyone wanting to run `hermes` must do so as aaas
+# ---------------------------------------------------------------------------
+# Bootstrap file manifest & placeholder resolution
+#
+# Single source of truth for every platform-repo file that install.sh
+# either requires to exist (MANDATORY_BOOTSTRAP_FILES) or resolves
+# __PLACEHOLDER__ tokens in (PLACEHOLDER_RESOLVE_FILES). Paths are relative
+# to PLATFORM_DIR. Adding a new bootstrap file to the platform repo means
+# adding one line to one (or both) of these lists — no new bash function
+# needed for the common case.
+#
+# MANDATORY_BOOTSTRAP_FILES: install.sh hard-fails if any of these are
+# missing after sync_platform_files. Reserve this for files whose absence
+# would silently break a feature rather than just fall back to a default
+# (e.g. the opencode recovery skill — without it, watchdog alerts still
+# fire but opencode has no documented recovery procedure to follow).
+#
+# PLACEHOLDER_RESOLVE_FILES: best-effort. Missing files are skipped with
+# a warning, not a failure — for optional/staged bootstrap files (like
+# config.yaml or SOUL.md) that a given deployment may simply not provide.
+# A file only needs to be listed in this array if it actually contains
+# __PLACEHOLDER__ tokens; special-cased files (config.yaml, SOUL.md) are
+# still listed here for consistency even though they get additional
+# handling beyond placeholder substitution (see write_hermes_config_yaml
+# and apply_hermes_soul_bootstrap below).
+# ---------------------------------------------------------------------------
+declare -a MANDATORY_BOOTSTRAP_FILES=(
+  ".opencode/skills/hermes-gateway-recovery/SKILL.md"
+)
+
+declare -a PLACEHOLDER_RESOLVE_FILES=(
+  ".hermes/config.yaml"
+  ".hermes/SOUL.md"
+  ".opencode/skills/hermes-gateway-recovery/SKILL.md"
+)
+
+declare -A BOOTSTRAP_PLACEHOLDERS=()
+
+# Must run after ensure_aaas_user (AAAS_HOME is only resolved there).
+build_bootstrap_placeholder_table() {
+  BOOTSTRAP_PLACEHOLDERS=(
+    ["__ROOT_DIR__"]="$ROOT_DIR"
+    ["__PLATFORM_DIR__"]="$PLATFORM_DIR"
+    ["__HERMES_HOME__"]="${AAAS_HOME}/.hermes"
+    ["__AAAS_USER__"]="$AAAS_USER"
+    ["__AAAS_GROUP__"]="$AAAS_GROUP"
+    ["__CONFIG_FILE__"]="$CONFIG_FILE"
+    ["__WATCHDOG_DIR__"]="$WATCHDOG_DIR"
+    ["__ALERT_DIR__"]="$ALERT_DIR"
+  )
+}
+
+validate_mandatory_bootstrap_files() {
+  step "Validating mandatory platform bootstrap files"
+
+  local rel missing=()
+  for rel in "${MANDATORY_BOOTSTRAP_FILES[@]}"; do
+    if [[ -f "${PLATFORM_DIR}/${rel}" ]]; then
+      ok "Found mandatory bootstrap file: ${rel}"
+    else
+      missing+=("$rel")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    fail "Missing mandatory platform bootstrap file(s): ${missing[*]}. Add them to the aaas repo under platform/ before rerunning."
+  fi
+}
+
+# Resolves every __PLACEHOLDER__ token in a single file, in place.
+resolve_placeholders_in_file() {
+  local file="$1"
+  local key sed_args=()
+
+  for key in "${!BOOTSTRAP_PLACEHOLDERS[@]}"; do
+    sed_args+=(-e "s|${key}|${BOOTSTRAP_PLACEHOLDERS[$key]}|g")
+  done
+
+  run_as_aaas sed -i "${sed_args[@]}" "$file"
+}
+
+# Loops PLACEHOLDER_RESOLVE_FILES and resolves any __PLACEHOLDER__ tokens
+# found, in place. Safe to rerun: files with no remaining placeholders are
+# left untouched rather than re-processed.
+resolve_all_bootstrap_placeholders() {
+  step "Resolving placeholders in bootstrap files"
+
+  local rel file
+  for rel in "${PLACEHOLDER_RESOLVE_FILES[@]}"; do
+    file="${PLATFORM_DIR}/${rel}"
+
+    if [[ ! -f "$file" ]]; then
+      warn "Bootstrap file not found, skipping placeholder resolution: ${rel}"
+      continue
+    fi
+
+    if grep -qE '__[A-Z_]+__' "$file"; then
+      resolve_placeholders_in_file "$file"
+      ok "Resolved placeholders in ${rel}"
+    else
+      ok "No unresolved placeholders in ${rel}; leaving as-is."
+    fi
+
+    run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$file"
+  done
+}
+
 install_hermes() {
   step "Installing Hermes"
 
@@ -780,10 +886,7 @@ EOF
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
-  resolve_config_bootstrap_placeholders
   write_hermes_config_yaml
-
-  write_default_hermes_soul_bootstrap
   apply_hermes_soul_bootstrap
 
   warn "Provider, model, fallback, and Telegram are not configured yet."
@@ -872,16 +975,34 @@ ensure_watchdog_sudo() {
   ok "aaas may now run: sudo ${HERMES_REAL_BIN} gateway <start|stop|restart|status> --system (NOPASSWD)."
 }
 
-# Renames a consumed bootstrap file to a timestamped backup.
-backup_bootstrap_file() {
-  local file="$1"
-  local backup="${file}.applied-$(date +%Y%m%d-%H%M%S)"
-  run_as_aaas mv "$file" "$backup"
-  ok "Backed up consumed bootstrap file to ${backup}."
-}
-
 # Applies PLATFORM_DIR/.hermes/config.yaml onto the config.yaml produced by
 # Hermes's own setup wizard, via a real YAML parse/merge (not text-append).
+#
+# Per-key merge behavior is controlled by an optional trailing directive
+# comment on the key's own line in the bootstrap file:
+#
+#   provider: mnemosyne     # @force     (default if no directive given)
+#   fallback: openai        # @default
+#   telegram:               # @disable
+#
+#   @force    — always overwrite this key with the bootstrap value, every
+#               run. This is also the default behavior when a key has no
+#               directive at all (matches the previous unconditional
+#               deep-merge semantics, so un-annotated bootstrap files keep
+#               working exactly as before).
+#   @default  — only set this key if it's missing from the real config;
+#               never clobber an existing/user-set value. Naturally
+#               idempotent: harmless to leave in place across reruns.
+#   @disable  — always comment out this key in the final config.yaml,
+#               regardless of what Hermes generated there. Top-level keys
+#               only (matches the previous whole-block-commented
+#               behavior, just expressed inline instead of requiring the
+#               whole block to be pre-commented in the bootstrap source).
+#
+# All three directives are idempotent by construction (force reasserts
+# every run by design; default only ever fires once and is a no-op after;
+# disable re-suppresses every run) — so, unlike the old scheme, no
+# "consumed/applied" bookkeeping or backup-renaming is needed here.
 write_hermes_config_yaml() {
   local hermes_config="${AAAS_HOME}/.hermes/config.yaml"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
@@ -909,19 +1030,65 @@ with open(path) as f:
 with open(bootstrap_path) as f:
     bootstrap_text = f.read()
 
-commented_keys = set(re.findall(r'^#[ ]?([A-Za-z0-9_.-]+):', bootstrap_text, re.MULTILINE))
-
 bootstrap = yaml.safe_load(bootstrap_text) or {}
 
-def deep_merge(base, overlay):
-    for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            deep_merge(base[key], value)
-        else:
-            base[key] = value
-    return base
+# ---- Build a dotted-path -> directive map by walking the raw bootstrap
+# text and tracking indentation to reconstruct nested key paths. Only
+# scalar "key:" lines are tracked (list items and multi-line block
+# scalars are out of scope for directive placement).
+DIRECTIVE_RE = re.compile(r'#\s*@(force|default|disable)\b')
+KEY_RE = re.compile(r'^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_.-]+):')
 
-deep_merge(cfg, bootstrap)
+directive_map = {}
+stack = []  # list of (indent_width, key)
+for line in bootstrap_text.splitlines():
+    if not line.strip() or line.lstrip().startswith('#'):
+        continue
+    m = KEY_RE.match(line)
+    if not m:
+        continue
+    indent = len(m.group('indent'))
+    key = m.group('key')
+    while stack and stack[-1][0] >= indent:
+        stack.pop()
+    dotted = '.'.join([k for _, k in stack] + [key])
+    stack.append((indent, key))
+    dm = DIRECTIVE_RE.search(line)
+    if dm:
+        directive_map[dotted] = dm.group(1)
+
+disabled_paths = []
+
+def merge_node(cfg_node, bootstrap_node, path_prefix):
+    for key, bvalue in bootstrap_node.items():
+        path = f"{path_prefix}.{key}" if path_prefix else key
+        directive = directive_map.get(path)
+
+        if directive == 'disable':
+            # Leave cfg_node's existing value untouched; comment it out of
+            # the final rendered output afterward instead.
+            disabled_paths.append(path)
+            continue
+
+        if directive == 'default':
+            if key not in cfg_node:
+                cfg_node[key] = bvalue
+            continue
+
+        # directive == 'force', or no directive at all (default behavior
+        # matches the original always-overwrite deep-merge semantics).
+        if isinstance(bvalue, dict) and directive is None and isinstance(cfg_node.get(key), dict):
+            # No explicit directive on a dict-valued key: recurse so
+            # sibling keys under this section that bootstrap doesn't
+            # mention are preserved, rather than wholesale-replaced.
+            merge_node(cfg_node[key], bvalue, path)
+        else:
+            # Explicit @force on a dict-valued key = atomic whole-subtree
+            # replace. Any scalar value (force, or default-behavior) is
+            # simply set.
+            cfg_node[key] = bvalue
+
+merge_node(cfg, bootstrap, '')
 
 dumped = yaml.dump(cfg, default_flow_style=False, sort_keys=False)
 
@@ -944,7 +1111,15 @@ def comment_out_block(text, key):
         out.append(line)
     return ''.join(out)
 
-for key in sorted(commented_keys):
+# @disable is only rendered for top-level keys (matches previous
+# whole-block-comment behavior). Nested @disable is detected but not
+# actionable here — flag it rather than silently ignoring it.
+top_level_disabled = sorted({p for p in disabled_paths if '.' not in p})
+for p in disabled_paths:
+    if '.' in p:
+        print(f"WARNING: nested @disable on '{p}' is not supported for comment-out rendering; ignoring.", file=sys.stderr)
+
+for key in top_level_disabled:
     dumped = comment_out_block(dumped, key)
 
 with open(path, "w") as f:
@@ -955,23 +1130,15 @@ PYEOF
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_config"
   run $SUDO chmod 660 "$hermes_config"
 
-  backup_bootstrap_file "$bootstrap_file"
   ok "Applied .hermes/config.yaml to config.yaml."
 }
 
-# Resolves __PLATFORM_DIR__ in the bootstrap config.yaml before write_hermes_config_yaml applies it.
-resolve_config_bootstrap_placeholders() {
-  local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
-
-  [[ -f "$bootstrap_file" ]] || return
-
-  if grep -q '__PLATFORM_DIR__' "$bootstrap_file"; then
-    run_as_aaas sed -i "s|__PLATFORM_DIR__|${PLATFORM_DIR}|g" "$bootstrap_file"
-    ok "Resolved __PLATFORM_DIR__ in .hermes/config.yaml (staging)."
-  fi
-}
-
 # Copies PLATFORM_DIR/.hermes/SOUL.md to AAAS_HOME/.hermes/SOUL.md.
+#
+# SOUL.md is static and freshly read by Hermes at the start of every
+# session, so it's always safe (and correct) to overwrite unconditionally
+# on every install.sh run — unlike config.yaml, there's no merge semantics
+# to reason about and no "consumed/applied" bookkeeping needed.
 apply_hermes_soul_bootstrap() {
   local soul_file="${AAAS_HOME}/.hermes/SOUL.md"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
@@ -985,19 +1152,7 @@ apply_hermes_soul_bootstrap() {
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$soul_file"
   run $SUDO chmod 660 "$soul_file"
 
-  backup_bootstrap_file "$bootstrap_file"
-  ok "Applied .hermes/SOUL.md to SOUL.md."
-}
-
-write_default_hermes_soul_bootstrap() {
-  local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
-
-  if [[ -f "$bootstrap_file" ]]; then
-    ok ".hermes/SOUL.md staging file already present; leaving it as-is."
-    return
-  fi
-
-  ok "No default .hermes/SOUL.md staging file written; create one at ${bootstrap_file} to preset SOUL.md."
+  ok "Applied .hermes/SOUL.md to SOUL.md (overwritten)."
 }
 
 # ---------------------------------------------------------------------------
@@ -1060,177 +1215,47 @@ ensure_venv_ensurepip_support() {
   fi
 }
 
-# ---------------------------------------------------------------------------
-# resolve_hermes_python — find the actual python interpreter Hermes runs on.
-#
-# HERMES_REAL_BIN often is NOT a python interpreter directly — it may be a
-# thin bash wrapper that `exec`s into a venv's own entrypoint script, e.g.:
-#
-#   #!/usr/bin/env bash
-#   unset PYTHONPATH
-#   unset PYTHONHOME
-#   exec "/home/aaas/.hermes/hermes-agent/venv/bin/hermes" "$@"
-#
-# In that case the real interpreter is python3 sitting in the SAME venv
-# bin/ directory as whatever the wrapper execs into — not something named
-# literally "python" in the wrapper text itself.
-#
-# Resolution order:
-#   1. If HERMES_REAL_BIN's own shebang already names a python interpreter,
-#      use that directly.
-#   2. Otherwise, grep the wrapper for an `exec ".../bin/<name>"` line and
-#      derive python3 from that same bin/ directory.
-#   3. Fall back to introspecting a live hermes process via /proc.
-# ---------------------------------------------------------------------------
-resolve_hermes_python() {
-  local shebang candidate venv_bin_dir
-
-  shebang="$(run_as_aaas head -n1 "$HERMES_REAL_BIN" 2>/dev/null | sed -n 's/^#!//p')"
-
-  # Case 1: shebang already IS a python interpreter.
-  if [[ "$shebang" == *python* ]] && run_as_aaas test -x "$shebang"; then
-    printf '%s' "$shebang"
-    return 0
-  fi
-
-  # Case 2: wrapper script `exec`s into another binary inside a venv's
-  # bin/ directory (e.g. `exec ".../hermes-agent/venv/bin/hermes" "$@"`).
-  # Derive python3 from that same bin/ directory.
-  if run_as_aaas test -r "$HERMES_REAL_BIN"; then
-    candidate="$(run_as_aaas grep -oE 'exec[[:space:]]+"?(/[^"'"'"' ]+/bin/[A-Za-z0-9_.-]+)"?' "$HERMES_REAL_BIN" 2>/dev/null \
-      | grep -oE '/[^"'"'"' ]+/bin/[A-Za-z0-9_.-]+' | head -n1)"
-    if [[ -n "$candidate" ]]; then
-      venv_bin_dir="$(dirname "$candidate")"
-      if run_as_aaas test -x "${venv_bin_dir}/python3"; then
-        printf '%s' "${venv_bin_dir}/python3"
-        return 0
-      elif run_as_aaas test -x "${venv_bin_dir}/python"; then
-        printf '%s' "${venv_bin_dir}/python"
-        return 0
-      fi
-    fi
-  fi
-
-  # Case 3: fall back to asking a live hermes gateway process directly via
-  # /proc, in case the launcher's structure is too dynamic to grep reliably.
-  candidate="$(pgrep -af 'hermes' 2>/dev/null | grep -oE '/[^ ]+/bin/python[0-9.]*' | head -n1 || true)"
-  if [[ -n "$candidate" && -x "$candidate" ]]; then
-    printf '%s' "$candidate"
-    return 0
-  fi
-
-  return 1
-}
-
-# ---------------------------------------------------------------------------
-# bootstrap_mnemosyne_into_hermes_venv — install mnemosyne-hermes into
-# whichever interpreter Hermes itself actually checks against.
-#
-# Earlier approach: guess the interpreter ourselves (resolve_hermes_python)
-# and install there directly. This turned out to be unreliable: guessing
-# via the wrapper's exec target found .../hermes-agent/venv/bin/python3,
-# and installing there DID succeed (import worked from that interpreter) —
-# but `mnemosyne-hermes install --force`'s own internal detection checks
-# a DIFFERENT, more specific path: the underlying uv toolchain interpreter
-# itself (e.g. ~/.local/share/uv/python/cpython-3.11.15.../bin/python3.11),
-# not the venv's own bin/python3. So a successful install into our guessed
-# path did not satisfy the tool's own check.
-#
-# Rather than keep guessing, we let `mnemosyne-hermes install --force`
-# report the exact interpreter path IT wants: on failure it prints a
-# ready-to-run `uv pip install --python <path> -U '<pkg>'` suggestion
-# (the exact target of its own internal detection). We capture that,
-# append --break-system-packages (needed since that interpreter's
-# environment is externally-managed under PEP 668 — plain installs are
-# blocked there), run it, then retry the plugin install.
-#
-# Idempotent: if `mnemosyne-hermes install --force` succeeds on the first
-# attempt (no bootstrap needed, e.g. a prior run already fixed it), the
-# retry loop below never triggers a second install.
-# ---------------------------------------------------------------------------
-resolve_and_fix_mnemosyne_hermes_bootstrap() {
-  local venv_bin="$1"
-  local attempt_output status target_python target_pkg
-
-  # A non-zero exit here is an EXPECTED, handled case (first-run
-  # externally-managed-environment failure), not a fatal error. BOTH the
-  # ERR trap (fires based on syntactic context, independent of -e) AND
-  # errexit itself (kills the script directly, independent of the trap)
-  # must be disabled together around this call, or one or the other will
-  # still kill the script before we get to inspect the failure ourselves.
-  trap - ERR
-  set +e
-  attempt_output="$(run_as_aaas "${venv_bin}/mnemosyne-hermes" install --force 2>&1)"
-  status=$?
-  set -e
-  trap 'fail "Installation stopped near line ${LINENO}."' ERR
-
-  printf '%s\n' "$attempt_output"
-
-  if [[ $status -eq 0 ]]; then
-    return 0
-  fi
-
-  if ! grep -q 'externally-managed-environment' <<<"$attempt_output"; then
-    fail "mnemosyne-hermes install --force failed for a reason other than the known externally-managed-environment case. See output above."
-  fi
-
-  # Parse the tool's own suggested fix line, e.g.:
-  #   uv pip install --python /home/aaas/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11 -U 'mnemosyne-hermes[all]'
-  target_python="$(grep -oE -- '--python[[:space:]]+[^[:space:]]+' <<<"$attempt_output" | head -n1 | awk '{print $2}')" || true
-  target_pkg="$(grep -oE "'[^']*mnemosyne-hermes[^']*'" <<<"$attempt_output" | head -n1 | tr -d "'")" || true
-
-  [[ -n "$target_python" ]] || fail "Could not parse the target python interpreter from mnemosyne-hermes's own bootstrap error output."
-  [[ -n "$target_pkg" ]] || target_pkg="mnemosyne-hermes"
-
-  warn "mnemosyne-hermes's own detection targets a different interpreter than expected: ${target_python}"
-  install_banner "mnemosyne-hermes bootstrap into ${target_python}"
-
-  if run_as_aaas bash -li -c "command -v uv >/dev/null 2>&1"; then
-    run_as_aaas bash -li -c "uv pip install --python '${target_python}' --break-system-packages -U '${target_pkg}'" \
-      || fail "uv pip install of ${target_pkg} into ${target_python} failed."
-  else
-    run_as_aaas "$target_python" -m pip install --quiet --upgrade --break-system-packages "$target_pkg" \
-      || fail "pip install --break-system-packages of ${target_pkg} into ${target_python} failed."
-  fi
-
-  run_as_aaas "$target_python" -c "import mnemosyne_hermes" >/dev/null 2>&1 \
-    || fail "mnemosyne-hermes still not importable from ${target_python} after bootstrap install."
-
-  ok "mnemosyne-hermes is now importable from ${target_python}."
-
-  # Retry the actual plugin registration now that the import is satisfied.
-  run_as_aaas "${venv_bin}/mnemosyne-hermes" install --force \
-    || fail "mnemosyne-hermes install --force still failed after fixing the interpreter bootstrap."
-}
 
 # ---------------------------------------------------------------------------
 # Install Mnemosyne as Hermes's sole memory provider.
 #
-# Canonical method per https://docs.mnemosyne.site/api/hermes-plugin:
+# Verified directly against the real `mnemosyne-hermes` CLI (--help output,
+# package metadata) and https://github.com/mnemosyne-oss/mnemosyne's docs
+# (docs/hermes-integration.md — "the canonical, most up-to-date reference"):
 #
-#   Do NOT install inside Hermes' managed venv — `hermes update` rebuilds
-#   the venv and wipes extra packages. The docs recommend pipx as the
-#   primary path, with a dedicated/standalone venv documented as the
-#   fallback. install.sh uses the standalone-venv fallback (not pipx) so
-#   the install location, ownership, and permissions stay fully under
-#   AaaS's own control, with no dependency on pipx being present on the
-#   target system:
+#   Standard SDK / Hermes plugin packages (per mnemosyne.site and PyPI):
+#     pip install mnemosyne-memory[embeddings]   — core + chosen backend
+#     pip install mnemosyne-hermes               — Hermes plugin, no extras
+#                                                   of its own (Provides-Extra
+#                                                   on PyPI is only
+#                                                   llm/mcp/test/dev/all —
+#                                                   there is no "embeddings"
+#                                                   extra on mnemosyne-hermes
+#                                                   itself)
 #
-#     python3 -m venv ~/.hermes/mnemosyne-venv
-#     ~/.hermes/mnemosyne-venv/bin/pip install mnemosyne-hermes
-#     ~/.hermes/mnemosyne-venv/bin/mnemosyne-hermes install --force
-#     hermes config set memory.provider mnemosyne
-#     hermes gateway restart
+#   Registration: mnemosyne-hermes install --force, run from a Python
+#   environment that has both packages installed.
 #
-# mnemosyne-hermes's OWN "install --force" step tries to auto-bootstrap
-# itself into Hermes's venv, but that venv is uv-managed (PEP 668
-# externally-managed) and its auto-bootstrap does a plain pip install
-# with no --break-system-packages, which always fails there. So
-# install.sh performs that bootstrap itself, correctly, via
-# bootstrap_mnemosyne_into_hermes_venv() BEFORE calling
-# `mnemosyne-hermes install --force` — at which point the auto-bootstrap
-# finds the import already satisfied and skips its broken logic.
+# install.sh installs both into a dedicated standalone venv
+# (${AAAS_HOME}/.hermes/mnemosyne-venv), never into Hermes's own managed
+# venv — `hermes update` rebuilds that venv and would wipe anything
+# installed there directly.
+#
+# Registration then uses `mnemosyne-hermes install --mode wrapper --python
+# <standalone-venv-python> --no-bootstrap` (all three flags confirmed live
+# against `mnemosyne-hermes install --help`). This is the tool's own
+# documented mechanism for exactly this situation — installing from a
+# separate/persistent venv without needing write access to Hermes's own
+# venv — and sidesteps two real problems we previously worked around
+# reactively: (1) Hermes's venv here is uv-managed and PEP 668
+# externally-managed, so the default ("symlink") mode's own internal
+# auto-bootstrap into Hermes's venv fails outright without
+# --break-system-packages, which the tool doesn't pass on its own; and
+# (2) that same auto-bootstrap always requests mnemosyne-hermes[all],
+# regardless of MNEMOSYNE_INSTALL_PROFILE, silently ignoring the profile
+# choice below. --mode wrapper avoids needing to touch Hermes's venv at
+# all, and --no-bootstrap guarantees the profile-ignorant auto-bootstrap
+# path is never triggered as a side effect.
 #
 # The platform/.hermes/config.yaml bootstrap must set:
 #   memory:
@@ -1331,24 +1356,34 @@ install_mnemosyne() {
 
   # ------------------------------------------------------------------
   # 3. Register the plugin with Hermes using mnemosyne-hermes's own
-  #    installer, run from the standalone venv. This is the documented
-  #    registration path and is safe to rerun via --force.
+  #    installer, run from the standalone venv, in WRAPPER mode.
   #
-  #    Hermes's venv is uv-managed (PEP 668 externally-managed), so if
-  #    mnemosyne-hermes isn't already importable there, its own internal
-  #    auto-bootstrap will fail with "externally-managed-environment"
-  #    (plain pip install, no --break-system-packages). Rather than
-  #    guess Hermes's interpreter path ourselves ahead of time, we run
-  #    the install, and if it fails that way, parse the interpreter path
-  #    mnemosyne-hermes itself reports needing, install there correctly
-  #    with --break-system-packages, then retry. See
-  #    resolve_and_fix_mnemosyne_hermes_bootstrap for details.
+  #    Verified directly against `mnemosyne-hermes install --help` and
+  #    `mnemosyne-hermes --help`: this is a real, documented CLI, not a
+  #    guess. Default ("symlink") mode requires mnemosyne-hermes to be
+  #    importable from WITHIN Hermes's own venv, and auto-bootstraps
+  #    itself there if not — which fails under Hermes's uv-managed,
+  #    PEP-668-externally-managed venv (needs --break-system-packages,
+  #    which the tool's own auto-bootstrap doesn't pass), and even when
+  #    worked around, always installs mnemosyne-hermes[all] regardless
+  #    of our chosen profile.
+  #
+  #    --mode wrapper --python <our venv's python> avoids all of that:
+  #    it creates a persistent shim under Hermes's plugins directory that
+  #    imports mnemosyne_hermes from OUR standalone venv, so nothing ever
+  #    needs to be installed into Hermes's own venv at all.
+  #    --no-bootstrap additionally guarantees the tool never attempts
+  #    its own (profile-ignorant) auto-bootstrap into Hermes's venv as a
+  #    side effect, regardless of mode.
   # ------------------------------------------------------------------
-  resolve_and_fix_mnemosyne_hermes_bootstrap "${mnemosyne_venv}/bin"
-  ok "Registered the mnemosyne plugin with Hermes (mnemosyne-hermes install --force)."
+  run_as_aaas "${mnemosyne_venv}/bin/mnemosyne-hermes" \
+    --hermes-home "${AAAS_HOME}/.hermes" \
+    install --force --no-bootstrap --mode wrapper --python "$venv_python" \
+    || fail "mnemosyne-hermes install --mode wrapper failed. Run 'sudo -u ${AAAS_USER} ${mnemosyne_venv}/bin/mnemosyne-hermes --hermes-home ${AAAS_HOME}/.hermes install --dry-run --mode wrapper --python ${venv_python}' to inspect."
+  ok "Registered the mnemosyne plugin with Hermes (wrapper mode, no changes made to Hermes's own venv)."
 
   # ------------------------------------------------------------------
-  # 5. Register mnemosyne as the active memory provider.
+  # 4. Register mnemosyne as the active memory provider.
   #    `hermes config set` writes memory.provider: mnemosyne into
   #    ~/.hermes/config.yaml without requiring an interactive session.
   # ------------------------------------------------------------------
@@ -1356,7 +1391,7 @@ install_mnemosyne() {
   ok "memory.provider set to mnemosyne in Hermes config."
 
   # ------------------------------------------------------------------
-  # 6. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
+  # 5. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
   #    This routes Mnemosyne's consolidation and fact-extraction LLM
   #    calls through Hermes's own authenticated provider, so no
   #    separate API key is needed for memory operations. It does NOT
@@ -1380,9 +1415,9 @@ install_mnemosyne() {
   ok "Mnemosyne install complete (standalone venv: ${mnemosyne_venv}, profile: ${profile:-core})."
   ok "Data will live at ${AAAS_HOME}/.hermes/mnemosyne/data/"
   warn "After gateway restart, verify with:"
-  warn "  sudo -u ${AAAS_USER} hermes plugins list | grep mnemosyne"
+  warn "  sudo -u ${AAAS_USER} ${mnemosyne_venv}/bin/mnemosyne-hermes --hermes-home ${AAAS_HOME}/.hermes status"
   warn "  sudo -u ${AAAS_USER} hermes mnemosyne stats"
-  warn "  sudo -u ${AAAS_USER} hermes doctor | grep -A5 'Memory Provider'"
+  warn "  sudo -u ${AAAS_USER} hermes doctor | grep -A5 'Memory Provider'   # (unconfirmed grep pattern — check actual doctor output if this doesn't match)"
 }
 
 write_watchdog() {
@@ -1497,51 +1532,104 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# write_opencode_hermes_skill — resolve placeholders in the
-# hermes-gateway-recovery skill so opencode's fallback recovery path (see
-# watchdog.sh's alert()) doesn't have to rely on the model guessing the
-# correct (sudo + real binary, not the wrapper) command each time.
+# Centralized placeholder resolution for every synced platform bootstrap
+# file. Add a new placeholder ONCE, to PLATFORM_PLACEHOLDERS, and it is
+# resolved automatically in every registered file below — no per-file sed
+# invocation needs to be written each time a new bootstrap file is added.
 #
-# The skill's actual content lives directly in the repo at
-# platform/.opencode/skills/hermes-gateway-recovery/SKILL.md — sync_platform_files
-# already clones the whole platform/ tree as-is into PLATFORM_DIR, so this
-# file already exists at exactly the path it needs to live at runtime.
-# This function's only job is to resolve the __PLACEHOLDER__ tokens
-# (AAAS_USER, CONFIG_FILE, WATCHDOG_DIR, ALERT_DIR) in place, the same
-# way resolve_config_bootstrap_placeholders() does for config.yaml.
+# Two file registries:
+#   PLATFORM_PLACEHOLDER_FILES_REQUIRED — must exist; install.sh fails
+#     loudly if missing, since core platform functionality depends on
+#     them (e.g. the opencode recovery skill).
+#   PLATFORM_PLACEHOLDER_FILES_OPTIONAL — user-supplied staging files that
+#     may legitimately be absent (e.g. no .hermes/config.yaml bootstrap
+#     was provided for this install); skipped with a warn, not a fail.
 #
-# Idempotent: uses a marker check so re-running install.sh against an
-# already-resolved file is a no-op rather than re-substituting into
-# already-resolved (placeholder-free) text.
+# To add a new bootstrap file in future: add its path to one of the two
+# arrays below. To add a new placeholder token: add one line to
+# init_platform_placeholders(). No other code changes needed.
 # ---------------------------------------------------------------------------
-write_opencode_hermes_skill() {
-  step "Resolving opencode hermes-gateway-recovery skill placeholders"
 
-  local skill_file="${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery/SKILL.md"
+declare -A PLATFORM_PLACEHOLDERS=()
 
-  if [[ ! -f "$skill_file" ]]; then
-    warn "Skill file not found at ${skill_file}; skipping."
-    warn "Add platform/.opencode/skills/hermes-gateway-recovery/SKILL.md to the aaas repo to enable this."
+# Populate the placeholder map. Must run after ensure_aaas_user, since
+# AAAS_HOME is only resolved there.
+init_platform_placeholders() {
+  PLATFORM_PLACEHOLDERS=(
+    [__PLATFORM_DIR__]="$PLATFORM_DIR"
+    [__HERMES_HOME__]="${AAAS_HOME}/.hermes"
+    [__AAAS_USER__]="$AAAS_USER"
+    [__AAAS_GROUP__]="$AAAS_GROUP"
+    [__ROOT_DIR__]="$ROOT_DIR"
+    [__CONFIG_FILE__]="$CONFIG_FILE"
+    [__WATCHDOG_DIR__]="$WATCHDOG_DIR"
+    [__ALERT_DIR__]="$ALERT_DIR"
+  )
+}
+
+# Files that MUST exist for the platform to function correctly.
+PLATFORM_PLACEHOLDER_FILES_REQUIRED=(
+  "${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery/SKILL.md"
+)
+
+# User-supplied staging/bootstrap files that may legitimately be absent.
+PLATFORM_PLACEHOLDER_FILES_OPTIONAL=(
+  "${PLATFORM_DIR}/.hermes/config.yaml"
+)
+
+# resolve_one_placeholder_file — apply the shared placeholder map to a
+# single file, in place, idempotently. Skips the sed pass entirely if no
+# registered placeholder token remains in the file (already resolved, or
+# never had any), rather than re-running sed against already-resolved text.
+resolve_one_placeholder_file() {
+  local file="$1"
+  local token pattern="" sed_args=()
+
+  for token in "${!PLATFORM_PLACEHOLDERS[@]}"; do
+    pattern="${pattern:+${pattern}|}${token}"
+  done
+
+  if ! grep -qE "$pattern" "$file"; then
+    ok "No unresolved placeholders in ${file}; leaving as-is."
     return
   fi
 
-  if ! grep -qE '__AAAS_USER__|__CONFIG_FILE__|__WATCHDOG_DIR__|__ALERT_DIR__' "$skill_file"; then
-    ok "Skill placeholders already resolved; leaving ${skill_file} as-is."
-    run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$(dirname "$skill_file")"
-    return
-  fi
+  for token in "${!PLATFORM_PLACEHOLDERS[@]}"; do
+    # sed's delimiter is | since substituted values (paths) may contain /.
+    sed_args+=(-e "s|${token}|${PLATFORM_PLACEHOLDERS[$token]}|g")
+  done
 
-  # sed's delimiter is | since the substituted values (paths) may
-  # themselves contain /.
-  run_as_aaas sed -i \
-    -e "s|__AAAS_USER__|${AAAS_USER}|g" \
-    -e "s|__CONFIG_FILE__|${CONFIG_FILE}|g" \
-    -e "s|__WATCHDOG_DIR__|${WATCHDOG_DIR}|g" \
-    -e "s|__ALERT_DIR__|${ALERT_DIR}|g" \
-    "$skill_file"
+  run_as_aaas sed -i "${sed_args[@]}" "$file"
+  ok "Resolved placeholders in ${file}."
+}
 
-  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$(dirname "$skill_file")"
-  ok "Resolved placeholders in ${skill_file}."
+# resolve_platform_placeholders — single entry point. Validates required
+# files exist (fails loudly if not), skips missing optional files with a
+# warn, and applies the shared placeholder map to whichever files are
+# present. Call once, after sync_platform_files, before anything that
+# consumes these files (e.g. write_hermes_config_yaml, opencode).
+resolve_platform_placeholders() {
+  step "Resolving platform bootstrap placeholders"
+
+  init_platform_placeholders
+
+  local file
+
+  for file in "${PLATFORM_PLACEHOLDER_FILES_REQUIRED[@]}"; do
+    [[ -f "$file" ]] || fail "Required bootstrap file is missing: ${file}. Add it to the aaas repo under platform/."
+    resolve_one_placeholder_file "$file"
+  done
+
+  for file in "${PLATFORM_PLACEHOLDER_FILES_OPTIONAL[@]}"; do
+    if [[ ! -f "$file" ]]; then
+      ok "Optional bootstrap file not present, skipping: ${file}"
+      continue
+    fi
+    resolve_one_placeholder_file "$file"
+  done
+
+  # Re-lock ownership across everything this touched.
+  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$PLATFORM_DIR"
 }
 
 configure_hermes_gateway_service_env() {
@@ -1669,9 +1757,9 @@ summary() {
   printf "     Mnemosyne will route its consolidation calls through that same provider.\n"
   printf "\n"
   printf "  2. Verify Mnemosyne is active:\n"
-  printf "       ${BOLD}sudo -u %s hermes plugins list | grep mnemosyne${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s %s/.hermes/mnemosyne-venv/bin/mnemosyne-hermes --hermes-home %s/.hermes status${RESET}\n" "$AAAS_USER" "$AAAS_HOME" "$AAAS_HOME"
   printf "       ${BOLD}sudo -u %s hermes mnemosyne stats${RESET}\n" "$AAAS_USER"
-  printf "       ${BOLD}sudo -u %s hermes doctor | grep -A5 'Memory Provider'${RESET}\n" "$AAAS_USER"
+  printf "       ${BOLD}sudo -u %s hermes doctor | grep -A5 'Memory Provider'${RESET}  (unconfirmed grep pattern)\n" "$AAAS_USER"
   printf "\n"
   printf "  3. (Optional) Add a fallback provider for reliability:\n"
   printf "       ${BOLD}sudo -u %s hermes fallback add${RESET}\n" "$AAAS_USER"
@@ -1712,11 +1800,14 @@ main() {
   # --- Service account & filesystem layout ---------------------------------
   install_base_packages
   ensure_aaas_user            # must run first: resolves AAAS_HOME
+  build_bootstrap_placeholder_table  # depends on AAAS_HOME from ensure_aaas_user
   provision_aaas_directories  # depends on AAAS_HOME from ensure_aaas_user
   ensure_aaas_profile         # must run before install_hermes
 
   # --- Platform source & core dependencies ----------------------------------
   sync_platform_files
+  validate_mandatory_bootstrap_files   # fail fast if required repo files are missing
+  resolve_all_bootstrap_placeholders   # __PLACEHOLDER__ substitution, once, for every listed file
   install_node
   install_opencode
   install_python_yaml
@@ -1729,7 +1820,6 @@ main() {
 
   # --- Watchdog & service wiring ----------------------------------------------
   write_watchdog
-  write_opencode_hermes_skill
   verify_hermes_runtime
   install_watchdog_service
 
