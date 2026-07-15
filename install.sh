@@ -722,11 +722,15 @@ install_docker() {
 # (config.yaml, SOUL.md) a given deployment may simply not provide.
 # ---------------------------------------------------------------------------
 declare -a MANDATORY_BOOTSTRAP_FILES=(
+  "watchdog/watchdog.sh"
+  "watchdog/watchdog.service"
   ".opencode/skills/hermes-gateway-recovery/SKILL.md"
   ".opencode/skills/watchdog-alert/SKILL.md"
 )
 
 declare -a PLACEHOLDER_RESOLVE_FILES=(
+  "watchdog/watchdog.sh"
+  "watchdog/watchdog.service"
   ".hermes/config.yaml"
   ".hermes/SOUL.md"
   ".opencode/skills/hermes-gateway-recovery/SKILL.md"
@@ -1312,133 +1316,24 @@ install_mnemosyne() {
 }
 
 write_watchdog() {
-  step "Creating the watchdog"
+  step "Preparing the watchdog"
 
-  # Watchdog script runs as aaas (enforced by the systemd unit). No sudo
-  # needed inside for file ops. systemctl start/restart/is-active on the
-  # gateway unit DO need sudo — see ensure_watchdog_systemctl_sudo().
-  run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.sh'" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
+  # Both watchdog.sh and watchdog.service are static repo files under
+  # platform/watchdog/, delivered straight to ${WATCHDOG_DIR} by
+  # sync_platform_files() (WATCHDOG_DIR is literally ${PLATFORM_DIR}/watchdog)
+  # and __PLACEHOLDER__-resolved by resolve_all_bootstrap_placeholders()
+  # earlier in main(). install.sh only needs to verify they landed and fix
+  # permissions — changing watchdog behavior or its systemd unit is a pure
+  # repo-file edit from here on.
+  local watchdog_script="${WATCHDOG_DIR}/watchdog.sh"
+  local watchdog_unit_file="${WATCHDOG_DIR}/watchdog.service"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLATFORM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/.env"
-ALERT_DIR="${SCRIPT_DIR}/alerts"
-LOG_FILE="${SCRIPT_DIR}/watchdog.log"
+  [[ -f "$watchdog_script" ]] || fail "watchdog.sh not found at ${watchdog_script}. It should have been synced from the platform repo."
+  [[ -f "$watchdog_unit_file" ]] || fail "watchdog.service not found at ${watchdog_unit_file}. It should have been synced from the platform repo."
 
-source "$CONFIG_FILE"
-
-stamp() {
-  date "+%Y-%m-%d %H:%M:%S"
-}
-
-log() {
-  printf "[%s] %s\n" "$(stamp)" "$*" >>"$LOG_FILE"
-}
-
-# alert <alert_code> <message> [key: value ...]
-#
-# Generic, target-agnostic alert dispatcher. Writes a structured alert.txt
-# into a unique timestamped folder and hands the folder to opencode, which
-# routes to the matching "<alert_code>-recovery" skill via the
-# watchdog-alert skill. Any future watchdog check (docker engine, disk
-# space, etc.) reuses this same function unchanged.
-#
-# alert_code must match the "<alert_code>-recovery" skill name exactly
-# (e.g. "hermes-gateway" -> hermes-gateway-recovery). Extra key/value pairs
-# are freeform context for the recovery skill (e.g. "gateway_unit: ...").
-alert() {
-  local alert_code="$1"
-  local message="$2"
-  shift 2
-  local alert_path kv
-
-  alert_path="${ALERT_DIR}/alert-$(date "+%Y%m%d-%H%M%S")-$$"
-  mkdir -p "$alert_path"
-
-  {
-    printf "alert_code: %s\n" "$alert_code"
-    printf "timestamp_utc: %s\n" "$(date -u "+%Y-%m-%dT%H:%M:%SZ")"
-    printf "message: %s\n" "$message"
-    for kv in "$@"; do
-      printf "%s\n" "$kv"
-    done
-  } >"${alert_path}/alert.txt"
-
-  log "[$alert_code] $message"
-
-  if command -v opencode >/dev/null 2>&1; then
-    # No alert-specific detail in the prompt — the watchdog-alert skill
-    # reads everything it needs straight out of alert.txt.
-    (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert. Alert folder: ${alert_path}. Use the watchdog-alert skill.") >>"$LOG_FILE" 2>&1 || true
-  fi
-}
-
-process_running() {
-  pgrep -f "$1" >/dev/null 2>&1
-}
-
-# HERMES_GATEWAY_UNIT is written into CONFIG_FILE by install.sh's
-# persist_hermes_gateway_unit(). Controlled via plain systemctl, not the
-# `hermes` CLI — the hermes CLI's guard wrapper (blocks non-aaas) and the
-# --system subcommands' root requirement can never both be satisfied by a
-# single process. systemctl sidesteps this: the unit's own User=aaas
-# directive execs the process as aaas at the OS level. Matching NOPASSWD
-# sudoers grant installed by ensure_watchdog_systemctl_sudo() in install.sh.
-if [[ -z "${HERMES_GATEWAY_UNIT:-}" ]]; then
-  alert "hermes-gateway" "HERMES_GATEWAY_UNIT is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
-  exit 1
-fi
-
-if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
-  log "Hermes gateway system service is healthy."
-  exit 0
-fi
-
-log "Hermes gateway system service is not healthy; attempting restart."
-if sudo -n systemctl restart "$HERMES_GATEWAY_UNIT" >>"$LOG_FILE" 2>&1; then
-  sleep 3
-  if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
-    log "Hermes gateway system service recovered via systemctl restart."
-    exit 0
-  fi
-fi
-
-# Direct restart failed or didn't stick — hand off to opencode, which
-# follows the hermes-gateway-recovery skill for further remediation.
-alert "hermes-gateway" \
-  "Hermes gateway system service failed to start via 'sudo systemctl restart \"$HERMES_GATEWAY_UNIT\"'" \
-  "gateway_unit: $HERMES_GATEWAY_UNIT"
-exit 1
-EOF
-
-  run $SUDO chmod +x "${WATCHDOG_DIR}/watchdog.sh"
-  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "${WATCHDOG_DIR}/watchdog.sh"
-
-  # systemd unit runs as aaas:aaas — no sudo needed inside the script.
-  run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.service'" <<EOF
-[Unit]
-Description=AaaS Hermes watchdog
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${AAAS_USER}
-Group=${AAAS_GROUP}
-EnvironmentFile=${WATCHDOG_ENV_FILE}
-ExecStart=${WATCHDOG_DIR}/watchdog.sh
-Restart=always
-RestartSec=20
-WorkingDirectory=${PLATFORM_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  ok "Watchdog script written to ${WATCHDOG_DIR}/watchdog.sh."
-  ok "Optional systemd unit written to ${WATCHDOG_DIR}/watchdog.service."
+  run $SUDO chmod +x "$watchdog_script"
+  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$watchdog_script" "$watchdog_unit_file"
+  ok "Watchdog script and systemd unit ready under ${WATCHDOG_DIR}."
 }
 
 # resolve_hermes_gateway_unit_name — find the systemd unit name that

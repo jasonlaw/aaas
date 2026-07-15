@@ -1,0 +1,17 @@
+[Unit]
+Description=AaaS Hermes watchdog
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__AAAS_USER__
+Group=__AAAS_GROUP__
+EnvironmentFile=__WATCHDOG_ENV_FILE__
+ExecStart=__WATCHDOG_DIR__/watchdog.sh
+Restart=always
+RestartSec=20
+WorkingDirectory=__PLATFORM_DIR__
+
+[Install]
+WantedBy=multi-user.target
