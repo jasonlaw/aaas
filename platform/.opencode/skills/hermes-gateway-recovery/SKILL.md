@@ -69,7 +69,6 @@ sudo -u __AAAS_USER__ __HERMES_HOME__/mnemosyne-venv/bin/mnemosyne-hermes --herm
 sudo -u __AAAS_USER__ hermes mnemosyne stats
 ```
 
-Report back what `systemctl status __HERMES_GATEWAY_UNIT__` shows after
-recovery, plus the Mnemosyne checks above, and note the outcome in the
-alert file under `__ALERT_DIR__/` before removing it, so the audit trail
-is preserved.
+Once recovery is confirmed (or ruled out), use write-report skill to report back exactly what
+`systemctl status __HERMES_GATEWAY_UNIT__` showed and the result of the
+Mnemosyne checks above.

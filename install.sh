@@ -10,21 +10,20 @@ fi
 ROOT_DIR="${AAAS_ROOT:-/opt/aaas}"
 PLATFORM_DIR="${ROOT_DIR}/platform"
 WATCHDOG_DIR="${PLATFORM_DIR}/watchdog"
-# Platform-owned env file. General bootstrap values only (AAAS_ROOT,
-# HERMES_REAL_BIN) — consumed by install.sh itself on reruns via
-# config_value(). Deliberately lives outside Hermes's own directory
-# (AAAS_HOME/.hermes): install.sh must never write into that directory,
-# since that's where `hermes setup` later stores real provider config and
-# secrets. This file is NOT wired into any systemd unit's EnvironmentFile=
-# — the Hermes gateway unit finds ~/.hermes/.env on its own via User=aaas,
-# and the watchdog has its own separate env file (WATCHDOG_ENV_FILE below).
-# Neither copies values from the other.
+
+# Platform-owned env file (AAAS_ROOT, HERMES_REAL_BIN). Consumed by
+# install.sh itself on reruns via config_value(). Lives outside Hermes's
+# own directory (AAAS_HOME/.hermes) — install.sh must never write there,
+# since that's where `hermes setup` stores real provider config/secrets.
+# Not wired into any systemd EnvironmentFile=; the gateway unit finds
+# ~/.hermes/.env on its own via User=aaas, and the watchdog has its own
+# separate env file (WATCHDOG_ENV_FILE). Neither file copies from the other.
 CONFIG_FILE="${PLATFORM_DIR}/.env"
-# Watchdog-owned env file. Holds only what watchdog.sh/watchdog.service
-# need (currently just HERMES_GATEWAY_UNIT). Deliberately separate from
-# CONFIG_FILE and from Hermes's own ~/.hermes/.env — the watchdog never
-# reads Hermes's config and Hermes never reads the watchdog's.
+
+# Watchdog-owned env file, currently just HERMES_GATEWAY_UNIT. Deliberately
+# separate from CONFIG_FILE and from Hermes's ~/.hermes/.env.
 WATCHDOG_ENV_FILE="${WATCHDOG_DIR}/.env"
+
 AAAS_REPO_URL="${AAAS_REPO_URL:-https://github.com/jasonlaw/aaas.git}"
 AAAS_REPO_REF="${AAAS_REPO_REF:-master}"
 HERMES_OFFICIAL_INSTALL_URL="${HERMES_OFFICIAL_INSTALL_URL:-https://hermes-agent.nousresearch.com/install.sh}"
@@ -34,20 +33,16 @@ ALERT_DIR="${WATCHDOG_DIR}/alerts"
 # Dedicated service account that owns all AaaS files and runs all services.
 AAAS_USER="aaas"
 AAAS_GROUP="aaas"
-# Resolved after ensure_aaas_user() runs — always derived from /etc/passwd
-# so it is correct whether aaas was just created or already existed.
+# Resolved after ensure_aaas_user() runs — always derived from /etc/passwd,
+# correct whether aaas was just created or already existed.
 AAAS_HOME=""
-# The user who invoked this script (may equal AAAS_USER).
 LOGIN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-# If the installer is already running as aaas (e.g. WSL default user), give
-# aaas an interactive shell so the operator can use it directly. Otherwise
-# aaas is a background service account and nologin is the safer default.
-# NOTE: this only decides the shell used at *creation* time. Whether an
-# *existing* account's shell gets touched afterward is handled separately
-# in ensure_aaas_user() — see the comment there for why upgrade-only logic
-# is required (WSL's pre-created interactive aaas account must never be
-# silently downgraded to nologin just because a different user runs this
-# installer).
+
+# If already running as aaas (e.g. WSL default user), give it an
+# interactive shell. Otherwise aaas is a background service account and
+# nologin is the safer default. This only decides shell at *creation*
+# time — see ensure_aaas_user() for why an existing account's shell is
+# only ever upgraded, never downgraded.
 if [[ "$LOGIN_USER" == "$AAAS_USER" ]]; then
   AAAS_SHELL="/bin/bash"
 else
@@ -76,9 +71,9 @@ else
   CYAN=""
 fi
 
-# Root-only operations (package installs, systemd unit files, /usr/local/bin
-# symlink, useradd/usermod) still go through sudo. Everything that operates
-# on files under ROOT_DIR runs as AAAS_USER via run_as_aaas / sudo -u aaas.
+# Root-only operations (package installs, systemd units, /usr/local/bin
+# symlink, useradd/usermod) go through sudo. Everything operating on files
+# under ROOT_DIR runs as AAAS_USER via run_as_aaas / sudo -u aaas.
 SUDO=""
 if [[ "${EUID:-$(id -u)}" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
   SUDO="sudo"
@@ -86,14 +81,6 @@ fi
 
 trap 'fail "Installation stopped near line ${LINENO}."' ERR
 
-# ---------------------------------------------------------------------------
-# run_as_aaas — run a command as the aaas user.
-#
-# If the current user IS aaas (LOGIN_USER == AAAS_USER, or EUID matches),
-# the command runs directly — no sudo needed (WSL scenario where aaas is
-# the primary login user, or any case where the installer runs as aaas).
-# Otherwise it delegates via `sudo -u aaas`.
-# ---------------------------------------------------------------------------
 run_as_aaas() {
   if [[ "$(id -un)" == "$AAAS_USER" ]]; then
     "$@"
@@ -301,6 +288,9 @@ run_apt() {
   run $SUDO apt-get -o DPkg::Lock::Timeout="$lock_timeout" "$@"
 }
 
+# Install-time alert helper (distinct from the watchdog's own alert() —
+# this one fires from install.sh itself, e.g. if the gateway fails
+# verification during install). Kept simple/standalone for now.
 write_alert() {
   local message="$1"
   local alert_path
@@ -330,15 +320,14 @@ start_background_service() {
   fi
 
   printf "%s→%s starting %s\n" "${DIM}" "${RESET}" "$pattern"
-  # Run the background service as the aaas user.
   nohup run_as_aaas "$@" >>"$LOG_FILE" 2>&1 &
   sleep 3
 
   process_running "$pattern"
 }
 
-# Create dir and ensure it is owned by aaas:aaas with group-write so that
-# both the service account and members of the aaas group can write to it.
+# Create dir owned by aaas:aaas with group-write, so both the service
+# account and members of the aaas group can write to it.
 ensure_owned_dir() {
   local dir="$1"
 
@@ -349,10 +338,8 @@ ensure_owned_dir() {
     fi
   fi
 
-  # Transfer ownership to aaas:aaas and grant group-write so that members of
-  # the aaas group (including the login user) can read/write the directory.
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$dir"
-  run $SUDO chmod 2775 "$dir"   # setgid bit: new files inherit aaas group
+  run $SUDO chmod 2775 "$dir"   # setgid: new files inherit aaas group
 
   ok "Directory ready (owned by ${AAAS_USER}:${AAAS_GROUP}): $dir"
 }
@@ -361,10 +348,6 @@ ensure_owned_dir() {
 # Dedicated service account
 # ---------------------------------------------------------------------------
 
-# Create the aaas system group and user if they do not already exist.
-# The user gets no login shell and its home directory is ROOT_DIR.
-# If the invoking user is different from aaas, they are added to the aaas
-# group so they can read/write files under ROOT_DIR.
 ensure_aaas_user() {
   step "Ensuring '${AAAS_USER}' service account exists"
 
@@ -386,13 +369,11 @@ ensure_aaas_user() {
     ok "Created system user ${AAAS_USER} (home: ${ROOT_DIR}, shell: ${AAAS_SHELL})."
   else
     ok "User ${AAAS_USER} already exists."
-    # Only ever UPGRADE the shell (nologin -> bash), and only when we are
-    # currently running interactively as aaas ourselves. We deliberately
-    # never downgrade an existing shell (bash -> nologin): aaas may already
-    # be a real interactive account (e.g. WSL's pre-created default user),
-    # and a *different* login user rerunning this installer must not be
-    # able to silently lock that account down to nologin out from under
-    # whoever normally uses it.
+    # Only ever upgrade the shell (nologin -> bash), and only when we're
+    # currently running as aaas ourselves. Never downgrade an existing
+    # shell — aaas may already be a real interactive account (e.g. WSL's
+    # pre-created default user), and a different login user rerunning
+    # this installer must not silently lock that account to nologin.
     local current_shell
     current_shell="$(getent passwd "$AAAS_USER" | cut -d: -f7)"
     if [[ "$LOGIN_USER" == "$AAAS_USER" && "$current_shell" != "/bin/bash" ]]; then
@@ -403,15 +384,13 @@ ensure_aaas_user() {
     fi
   fi
 
-  # Always derive AAAS_HOME from /etc/passwd — works whether aaas was just
-  # created with --home-dir ROOT_DIR, or already existed with a different home
-  # (e.g. WSL pre-created aaas with /home/aaas).
+  # Always derive from /etc/passwd — correct whether aaas was just
+  # created with --home-dir ROOT_DIR, or already existed with a
+  # different home (e.g. WSL pre-created aaas with /home/aaas).
   AAAS_HOME="$(getent passwd "$AAAS_USER" | cut -d: -f6)"
   [[ -n "$AAAS_HOME" ]] || fail "Cannot determine home directory for ${AAAS_USER} from /etc/passwd."
   ok "Resolved ${AAAS_USER} home: ${AAAS_HOME}."
 
-  # If the person running install.sh is not aaas, add them to the aaas group
-  # so they can read/write files under ROOT_DIR without needing sudo.
   if [[ "$LOGIN_USER" != "$AAAS_USER" ]]; then
     if id -nG "$LOGIN_USER" 2>/dev/null | grep -qw "$AAAS_GROUP"; then
       ok "${LOGIN_USER} is already a member of ${AAAS_GROUP}."
@@ -423,15 +402,12 @@ ensure_aaas_user() {
   fi
 }
 
-
-# Ensure /opt/aaas/.bash_profile sources .bashrc so that `bash -li` (login
-# shell) reliably loads whatever PATH entries the Hermes installer wrote into
-# .bashrc. Without this, bash -li sources /etc/profile and ~/.bash_profile
-# only — NOT ~/.bashrc — so the Hermes bin dir is invisible to login shells.
+# Ensure ~/.bash_profile sources .bashrc so that `bash -li` (login shell)
+# reliably loads PATH entries the Hermes installer wrote into .bashrc.
+# Without this, bash -li sources /etc/profile and ~/.bash_profile only —
+# not ~/.bashrc — so the Hermes bin dir is invisible to login shells.
 ensure_aaas_profile() {
   local profile="${AAAS_HOME}/.bash_profile"
-  # Use a unique marker comment so the idempotency check is unambiguous —
-  # grep for the marker, not the actual shell line, to avoid quoting issues.
   local marker="# AaaS: source .bashrc for login shells"
 
   if [[ -f "$profile" ]] && grep -Fq "$marker" "$profile" 2>/dev/null; then
@@ -439,22 +415,14 @@ ensure_aaas_profile() {
     return
   fi
 
-  # Append the sourcing block. Using run_as_aaas tee -a avoids quoting
-  # issues with heredocs passed through sudo.
   printf '\n%s\n%s\n' "$marker" '[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"' \
     | run_as_aaas tee -a "$profile" >/dev/null
   ok "Updated ${profile} to source .bashrc for login shells."
 }
 
-# ---------------------------------------------------------------------------
-# provision_aaas_directories — create every directory install.sh itself
-# needs up front, all owned by aaas:aaas via ensure_owned_dir. Must run
-# after ensure_aaas_user, since AAAS_HOME is only resolved there.
-#
-# Directories created later by Hermes, opencode, or Docker themselves
-# (e.g. AAAS_HOME/.hermes/hermes-agent) are provisioned by those tools,
-# not listed here.
-# ---------------------------------------------------------------------------
+# Directories install.sh itself needs up front. Must run after
+# ensure_aaas_user (AAAS_HOME resolved there). Directories created later
+# by Hermes/opencode/Docker themselves are provisioned by those tools.
 provision_aaas_directories() {
   step "Provisioning AaaS directory layout"
 
@@ -503,7 +471,6 @@ sync_platform_files() {
     run_as_aaas cp -a "$source_platform/." "$PLATFORM_DIR/"
   fi
 
-  # Ensure all synced files are owned by aaas:aaas.
   run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$PLATFORM_DIR"
 
   [[ -z "$tmp_source" ]] || rm -rf "$tmp_source"
@@ -570,9 +537,6 @@ install_base_packages() {
     done
   fi
 
-  # Directories are created after ensure_aaas_user, so ownership can be set
-  # correctly. Here we just make sure ROOT_DIR exists so useradd --home-dir
-  # doesn't complain.
   [[ -d "$ROOT_DIR" ]] || run $SUDO mkdir -p "$ROOT_DIR"
   ok "Base tools are ready."
 }
@@ -677,7 +641,6 @@ install_docker() {
 
   if have docker; then
     ok "Docker is already available."
-    # Add aaas user to the docker group so it can run containers without sudo.
     if getent group docker >/dev/null 2>&1; then
       if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
         run $SUDO usermod -aG docker "$AAAS_USER"
@@ -732,7 +695,6 @@ install_docker() {
     run $SUDO systemctl enable --now docker || true
   fi
 
-  # Add aaas to docker group after install.
   if getent group docker >/dev/null 2>&1; then
     if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
       run $SUDO usermod -aG docker "$AAAS_USER"
@@ -743,37 +705,25 @@ install_docker() {
   have docker && ok "Docker is installed." || warn "Docker still needs manual installation."
 }
 
-# Hermes is installed as the aaas user so that:
-#   - All files under Hermes's home (AAAS_HOME/.hermes) are owned by aaas
-#   - The binary lands in aaas's local path
-#   - Anyone wanting to run `hermes` must do so as aaas
 # ---------------------------------------------------------------------------
 # Bootstrap file manifest & placeholder resolution
 #
-# Single source of truth for every platform-repo file that install.sh
-# either requires to exist (MANDATORY_BOOTSTRAP_FILES) or resolves
-# __PLACEHOLDER__ tokens in (PLACEHOLDER_RESOLVE_FILES). Paths are relative
-# to PLATFORM_DIR. Adding a new bootstrap file to the platform repo means
-# adding one line to one (or both) of these lists — no new bash function
-# needed for the common case.
+# Single source of truth for every platform-repo file install.sh either
+# requires to exist (MANDATORY_BOOTSTRAP_FILES) or resolves __PLACEHOLDER__
+# tokens in (PLACEHOLDER_RESOLVE_FILES). Paths relative to PLATFORM_DIR.
 #
-# MANDATORY_BOOTSTRAP_FILES: install.sh hard-fails if any of these are
-# missing after sync_platform_files. Reserve this for files whose absence
-# would silently break a feature rather than just fall back to a default
-# (e.g. the opencode recovery skill — without it, watchdog alerts still
+# MANDATORY_BOOTSTRAP_FILES: install.sh hard-fails if any are missing after
+# sync_platform_files. Reserve this for files whose absence would silently
+# break a feature (e.g. a recovery skill: without it, watchdog alerts still
 # fire but opencode has no documented recovery procedure to follow).
 #
-# PLACEHOLDER_RESOLVE_FILES: best-effort. Missing files are skipped with
-# a warning, not a failure — for optional/staged bootstrap files (like
-# config.yaml or SOUL.md) that a given deployment may simply not provide.
-# A file only needs to be listed in this array if it actually contains
-# __PLACEHOLDER__ tokens; special-cased files (config.yaml, SOUL.md) are
-# still listed here for consistency even though they get additional
-# handling beyond placeholder substitution (see write_hermes_config_yaml
-# and apply_hermes_soul_bootstrap below).
+# PLACEHOLDER_RESOLVE_FILES: best-effort — missing files are skipped with a
+# warning, not a failure, since some are optional/staged bootstrap files
+# (config.yaml, SOUL.md) a given deployment may simply not provide.
 # ---------------------------------------------------------------------------
 declare -a MANDATORY_BOOTSTRAP_FILES=(
   ".opencode/skills/hermes-gateway-recovery/SKILL.md"
+  ".opencode/skills/watchdog-alert/SKILL.md"
 )
 
 declare -a PLACEHOLDER_RESOLVE_FILES=(
@@ -784,7 +734,7 @@ declare -a PLACEHOLDER_RESOLVE_FILES=(
 
 declare -A BOOTSTRAP_PLACEHOLDERS=()
 
-# Must run after ensure_aaas_user (AAAS_HOME is only resolved there).
+# Must run after ensure_aaas_user (AAAS_HOME only resolved there).
 build_bootstrap_placeholder_table() {
   BOOTSTRAP_PLACEHOLDERS=(
     ["__ROOT_DIR__"]="$ROOT_DIR"
@@ -830,7 +780,7 @@ resolve_placeholders_in_file() {
 
 # Loops PLACEHOLDER_RESOLVE_FILES and resolves any __PLACEHOLDER__ tokens
 # found, in place. Safe to rerun: files with no remaining placeholders are
-# left untouched rather than re-processed.
+# left untouched.
 resolve_all_bootstrap_placeholders() {
   step "Resolving placeholders in bootstrap files"
 
@@ -854,38 +804,17 @@ resolve_all_bootstrap_placeholders() {
   done
 }
 
-# ---------------------------------------------------------------------------
-# resolve_late_bound_gateway_unit_placeholder — resolve __HERMES_GATEWAY_UNIT__
-# specifically, once its value is actually known.
-#
-# This placeholder is deliberately NOT part of BOOTSTRAP_PLACEHOLDERS /
-# resolve_all_bootstrap_placeholders(): that pass runs early in main(),
-# right after sync_platform_files, well before Hermes is even installed —
-# so the gateway's systemd unit name doesn't exist yet at that point.
-# resolve_all_bootstrap_placeholders() simply leaves this one token
-# untouched on its first pass (sed only substitutes keys present in
-# BOOTSTRAP_PLACEHOLDERS; an absent key is a harmless no-op, not an
-# error), and this function finishes the job later, once
-# resolve_hermes_gateway_unit_name() actually has an answer.
-#
-# Reuses resolve_placeholders_in_file() — the same generic single-file
-# resolver — just with a one-entry table and called at the right time,
-# rather than introducing a separate substitution mechanism.
-# ---------------------------------------------------------------------------
-resolve_late_bound_gateway_unit_placeholder() {
+# resolve_gateway_unit_placeholder — resolve __HERMES_GATEWAY_UNIT__ once
+# its value is actually known. Not part of the main resolve_all_bootstrap_
+# placeholders pass: the gateway's systemd unit name doesn't exist until
+# `hermes gateway install --system` runs, well after that pass. Adds the
+# now-known value to the shared table and re-runs the generic resolver —
+# resolve_placeholders_in_file() is a no-op on files with no remaining
+# tokens, so this is safe to call after the first pass has already run.
+resolve_gateway_unit_placeholder() {
   local unit_name="$1"
-  local file="${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery/SKILL.md"
-
-  [[ -f "$file" ]] || return 0
-
-  if ! grep -q '__HERMES_GATEWAY_UNIT__' "$file"; then
-    return 0
-  fi
-
   BOOTSTRAP_PLACEHOLDERS["__HERMES_GATEWAY_UNIT__"]="$unit_name"
-  resolve_placeholders_in_file "$file"
-  run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$file"
-  ok "Resolved __HERMES_GATEWAY_UNIT__ in the recovery skill (unit: ${unit_name})."
+  resolve_all_bootstrap_placeholders
 }
 
 install_hermes() {
@@ -903,8 +832,6 @@ install_hermes() {
     ok "Hermes installer finished."
   fi
 
-  # Safety net: ensure Hermes's home directory and everything in it is
-  # owned by aaas.
   run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "${AAAS_HOME}/.hermes"
   run $SUDO chmod -R g+rX "${AAAS_HOME}/.hermes"
 
@@ -913,15 +840,10 @@ install_hermes() {
   ensure_hermes_wrapper
 
   # Written to PLATFORM_DIR/.env, not AAAS_HOME/.hermes/.env — install.sh
-  # never touches Hermes's own directory, which is where `hermes setup`
-  # later stores real provider config and secrets.
-  #
-  # HERMES_REAL_BIN is written here (not just kept in-memory) so that the
-  # watchdog — a separate process started later by systemd — can call the
-  # real hermes binary directly for --system gateway operations, bypassing
-  # the /usr/local/bin/hermes guard wrapper the same way install.sh itself
-  # does in verify_hermes_runtime(). See ensure_watchdog_sudo() for the
-  # matching sudoers grant that makes this work non-interactively.
+  # never touches Hermes's own directory. HERMES_REAL_BIN is persisted so
+  # the watchdog (a separate process started later by systemd) can call
+  # the real hermes binary directly, bypassing the guard wrapper the same
+  # way verify_hermes_runtime() does.
   run_as_aaas bash -c "cat >\"$CONFIG_FILE\"" <<EOF
 # Generated by install.sh
 AAAS_ROOT=${ROOT_DIR}
@@ -931,6 +853,18 @@ EOF
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$CONFIG_FILE"
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# configure_hermes_platform — apply platform bootstrap files (config.yaml,
+# SOUL.md) onto an already-installed Hermes. Deliberately separate from
+# install_hermes(): this is platform configuration, not installation — it
+# runs once all components are present and __PLACEHOLDER__ tokens are
+# resolved, and it's the natural place to add more platform-level Hermes
+# configuration steps in future without touching install_hermes() itself.
+# ---------------------------------------------------------------------------
+configure_hermes_platform() {
+  step "Applying platform configuration to Hermes"
 
   write_hermes_config_yaml
   apply_hermes_soul_bootstrap
@@ -939,15 +873,13 @@ EOF
   warn "Run: sudo -u ${AAAS_USER} hermes setup"
 }
 
-# Install a guard wrapper at /usr/local/bin/hermes that:
-#   - Allows the command through when running as aaas
-#   - Blocks anyone else with a clear error and usage hint
+# Guard wrapper at /usr/local/bin/hermes: allows the command through only
+# when running as aaas, blocks anyone else with a clear error.
 HERMES_BIN=""
 HERMES_REAL_BIN=""
 ensure_hermes_wrapper() {
   local real_bin wrapper="/usr/local/bin/hermes"
 
-  # Resolve the actual hermes binary from aaas's perspective.
   real_bin="$(run_as_aaas bash -li -c 'command -v hermes')"
   [[ -n "$real_bin" && "$real_bin" != "$wrapper" ]] \
     || fail "Cannot resolve hermes binary path as ${AAAS_USER}."
@@ -975,23 +907,15 @@ WRAPPER
 }
 
 # ---------------------------------------------------------------------------
-# ensure_watchdog_sudo — grant aaas a narrowly-scoped, passwordless sudo
-# rule to run ONLY "$HERMES_REAL_BIN gateway ..." as root.
+# ensure_watchdog_sudo — scoped, passwordless sudo for aaas to run ONLY
+# "$HERMES_REAL_BIN gateway ..." as root. Used for diagnostics only (e.g.
+# `hermes gateway status --system`) — the actual restart/health-check path
+# goes through systemctl directly (see ensure_watchdog_systemctl_sudo),
+# since the hermes CLI's guard wrapper (blocks non-aaas) and the --system
+# subcommands' root requirement can never both be satisfied by one process.
 #
-# NOTE: this grant is now used for diagnostics only (e.g. `hermes gateway
-# status --system` for richer application-level health info beyond "is the
-# process running"). The actual restart/health-check path used by
-# watchdog.sh, the opencode recovery skill, and summary() has moved to
-# systemctl directly — see ensure_watchdog_systemctl_sudo and
-# persist_hermes_gateway_unit's docstring for why: the hermes CLI's own
-# guard wrapper (blocks non-aaas) and the --system subcommands' root
-# requirement can never both be satisfied by one process, which produced
-# a real ping-pong failure in practice ("must run as aaas" <-> "requires
-# root", no matter how the command was invoked).
-#
-# The rule is scoped to the exact resolved binary path plus a literal
-# "gateway" subcommand — not a general NOPASSWD grant for aaas — so a
-# compromised watchdog process can't sudo anything else.
+# Scoped to the exact resolved binary path plus a literal "gateway"
+# subcommand, so a compromised watchdog process can't sudo anything else.
 # ---------------------------------------------------------------------------
 ensure_watchdog_sudo() {
   step "Granting scoped sudo for Hermes gateway control (diagnostics)"
@@ -1026,19 +950,15 @@ ensure_watchdog_sudo() {
 }
 
 # ---------------------------------------------------------------------------
-# ensure_watchdog_systemctl_sudo — grant aaas a narrowly-scoped, passwordless
-# sudo rule to run ONLY `systemctl {start,stop,restart,is-active,status}
-# <exact-unit-name>` as root. This is the PRIMARY mechanism watchdog.sh,
-# the opencode recovery skill, and summary() all use to control the Hermes
-# gateway service — see persist_hermes_gateway_unit's docstring for the
-# real operational failure (a root-vs-aaas ping-pong through the hermes
-# CLI's own guard wrapper) that led to switching from `hermes gateway ...
-# --system` to plain systemctl for this.
+# ensure_watchdog_systemctl_sudo — scoped, passwordless sudo for aaas to
+# run ONLY `systemctl {start,stop,restart,is-active,status} <exact-unit>`
+# as root. This is the PRIMARY mechanism watchdog.sh, the recovery skill,
+# and summary() use to control the Hermes gateway service, sidestepping
+# the wrapper-vs-root conflict noted above.
 #
-# Scoped to the exact unit name (not a wildcard like "hermes*") so a
-# compromised watchdog process can't restart/stop arbitrary services.
-# Must be called only after the unit name is known (i.e. after
-# `hermes gateway install --system` has actually created it).
+# Scoped to the exact unit name (not a wildcard), so a compromised
+# watchdog process can't restart/stop arbitrary services. Call only after
+# the unit name is known (i.e. after `hermes gateway install --system`).
 # ---------------------------------------------------------------------------
 ensure_watchdog_systemctl_sudo() {
   local unit_name="$1"
@@ -1076,34 +996,23 @@ ensure_watchdog_systemctl_sudo() {
   ok "aaas may now run: sudo systemctl <start|stop|restart|status|is-active> ${unit_name} (NOPASSWD)."
 }
 
-# Applies PLATFORM_DIR/.hermes/config.yaml onto the config.yaml produced by
-# Hermes's own setup wizard, via a real YAML parse/merge (not text-append).
-#
-# Per-key merge behavior is controlled by an optional trailing directive
-# comment on the key's own line in the bootstrap file:
+# ---------------------------------------------------------------------------
+# Applies PLATFORM_DIR/.hermes/config.yaml onto Hermes's generated
+# config.yaml via a real YAML parse/merge (not text-append). Per-key merge
+# behavior is controlled by an optional trailing directive comment:
 #
 #   provider: mnemosyne     # @force     (default if no directive given)
 #   fallback: openai        # @default
 #   telegram:               # @disable
 #
-#   @force    — always overwrite this key with the bootstrap value, every
-#               run. This is also the default behavior when a key has no
-#               directive at all (matches the previous unconditional
-#               deep-merge semantics, so un-annotated bootstrap files keep
-#               working exactly as before).
-#   @default  — only set this key if it's missing from the real config;
-#               never clobber an existing/user-set value. Naturally
-#               idempotent: harmless to leave in place across reruns.
-#   @disable  — always comment out this key in the final config.yaml,
-#               regardless of what Hermes generated there. Top-level keys
-#               only (matches the previous whole-block-commented
-#               behavior, just expressed inline instead of requiring the
-#               whole block to be pre-commented in the bootstrap source).
+#   @force    — always overwrite this key with the bootstrap value.
+#   @default  — only set if missing from the real config; never clobber.
+#   @disable  — always comment out this key in the final config.yaml
+#               (top-level keys only).
 #
-# All three directives are idempotent by construction (force reasserts
-# every run by design; default only ever fires once and is a no-op after;
-# disable re-suppresses every run) — so, unlike the old scheme, no
-# "consumed/applied" bookkeeping or backup-renaming is needed here.
+# All three are idempotent by construction, so no "consumed" bookkeeping
+# is needed.
+# ---------------------------------------------------------------------------
 write_hermes_config_yaml() {
   local hermes_config="${AAAS_HOME}/.hermes/config.yaml"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/config.yaml"
@@ -1133,15 +1042,11 @@ with open(bootstrap_path) as f:
 
 bootstrap = yaml.safe_load(bootstrap_text) or {}
 
-# ---- Build a dotted-path -> directive map by walking the raw bootstrap
-# text and tracking indentation to reconstruct nested key paths. Only
-# scalar "key:" lines are tracked (list items and multi-line block
-# scalars are out of scope for directive placement).
 DIRECTIVE_RE = re.compile(r'#\s*@(force|default|disable)\b')
 KEY_RE = re.compile(r'^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_.-]+):')
 
 directive_map = {}
-stack = []  # list of (indent_width, key)
+stack = []
 for line in bootstrap_text.splitlines():
     if not line.strip() or line.lstrip().startswith('#'):
         continue
@@ -1166,8 +1071,6 @@ def merge_node(cfg_node, bootstrap_node, path_prefix):
         directive = directive_map.get(path)
 
         if directive == 'disable':
-            # Leave cfg_node's existing value untouched; comment it out of
-            # the final rendered output afterward instead.
             disabled_paths.append(path)
             continue
 
@@ -1176,17 +1079,9 @@ def merge_node(cfg_node, bootstrap_node, path_prefix):
                 cfg_node[key] = bvalue
             continue
 
-        # directive == 'force', or no directive at all (default behavior
-        # matches the original always-overwrite deep-merge semantics).
         if isinstance(bvalue, dict) and directive is None and isinstance(cfg_node.get(key), dict):
-            # No explicit directive on a dict-valued key: recurse so
-            # sibling keys under this section that bootstrap doesn't
-            # mention are preserved, rather than wholesale-replaced.
             merge_node(cfg_node[key], bvalue, path)
         else:
-            # Explicit @force on a dict-valued key = atomic whole-subtree
-            # replace. Any scalar value (force, or default-behavior) is
-            # simply set.
             cfg_node[key] = bvalue
 
 merge_node(cfg, bootstrap, '')
@@ -1212,9 +1107,6 @@ def comment_out_block(text, key):
         out.append(line)
     return ''.join(out)
 
-# @disable is only rendered for top-level keys (matches previous
-# whole-block-comment behavior). Nested @disable is detected but not
-# actionable here — flag it rather than silently ignoring it.
 top_level_disabled = sorted({p for p in disabled_paths if '.' not in p})
 for p in disabled_paths:
     if '.' in p:
@@ -1227,19 +1119,16 @@ with open(path, "w") as f:
     f.write(dumped)
 PYEOF
 
-  # Re-lock ownership/permissions after Python rewrote the file.
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_config"
   run $SUDO chmod 660 "$hermes_config"
 
   ok "Applied .hermes/config.yaml to config.yaml."
 }
 
-# Copies PLATFORM_DIR/.hermes/SOUL.md to AAAS_HOME/.hermes/SOUL.md.
-#
-# SOUL.md is static and freshly read by Hermes at the start of every
-# session, so it's always safe (and correct) to overwrite unconditionally
-# on every install.sh run — unlike config.yaml, there's no merge semantics
-# to reason about and no "consumed/applied" bookkeeping needed.
+# Copies PLATFORM_DIR/.hermes/SOUL.md over AAAS_HOME/.hermes/SOUL.md.
+# SOUL.md is static and freshly read by Hermes each session, so it's
+# always safe to overwrite unconditionally on every run — no merge
+# semantics needed, unlike config.yaml.
 apply_hermes_soul_bootstrap() {
   local soul_file="${AAAS_HOME}/.hermes/SOUL.md"
   local bootstrap_file="${PLATFORM_DIR}/.hermes/SOUL.md"
@@ -1258,14 +1147,12 @@ apply_hermes_soul_bootstrap() {
 
 # ---------------------------------------------------------------------------
 # ensure_venv_ensurepip_support — make sure `python3 -m venv` actually
-# produces a venv with a working pip. `python3 -m venv --help` always
-# succeeds regardless of ensurepip availability, so it cannot be used to
-# detect this; instead we create a throwaway venv and check for pip.
+# produces a venv with a working pip (its --help succeeds regardless, so
+# it can't be used to detect this; we create a throwaway venv instead).
 #
-# On Debian/Ubuntu, ensurepip support ships in a *version-specific*
-# package (e.g. python3.14-venv), not always covered by the generic
-# "python3-venv" package name if python3 is newer than the distro
-# default target. Try the version-specific package first, then fall back.
+# On Debian/Ubuntu, ensurepip support ships in a version-specific package
+# (e.g. python3.14-venv), not always covered by generic "python3-venv" if
+# python3 is newer than the distro default. Try version-specific first.
 # ---------------------------------------------------------------------------
 ensure_venv_ensurepip_support() {
   local probe_dir
@@ -1303,8 +1190,6 @@ ensure_venv_ensurepip_support() {
       ;;
   esac
 
-  # Re-verify; fail loudly rather than let venv creation silently produce
-  # a pip-less environment again.
   probe_dir="$(mktemp -d)"
   if python3 -m venv "${probe_dir}/probe" >/dev/null 2>&1 \
      && [[ -x "${probe_dir}/probe/bin/pip" || -x "${probe_dir}/probe/bin/pip3" ]]; then
@@ -1316,47 +1201,17 @@ ensure_venv_ensurepip_support() {
   fi
 }
 
-
 # ---------------------------------------------------------------------------
-# Install Mnemosyne as Hermes's sole memory provider.
+# Install Mnemosyne as Hermes's sole memory provider, into a dedicated
+# standalone venv (never into Hermes's own managed venv — `hermes update`
+# rebuilds that and would wipe anything installed there directly).
 #
-# Verified directly against the real `mnemosyne-hermes` CLI (--help output,
-# package metadata) and https://github.com/mnemosyne-oss/mnemosyne's docs
-# (docs/hermes-integration.md — "the canonical, most up-to-date reference"):
-#
-#   Standard SDK / Hermes plugin packages (per mnemosyne.site and PyPI):
-#     pip install mnemosyne-memory[embeddings]   — core + chosen backend
-#     pip install mnemosyne-hermes               — Hermes plugin, no extras
-#                                                   of its own (Provides-Extra
-#                                                   on PyPI is only
-#                                                   llm/mcp/test/dev/all —
-#                                                   there is no "embeddings"
-#                                                   extra on mnemosyne-hermes
-#                                                   itself)
-#
-#   Registration: mnemosyne-hermes install --force, run from a Python
-#   environment that has both packages installed.
-#
-# install.sh installs both into a dedicated standalone venv
-# (${AAAS_HOME}/.hermes/mnemosyne-venv), never into Hermes's own managed
-# venv — `hermes update` rebuilds that venv and would wipe anything
-# installed there directly.
-#
-# Registration then uses `mnemosyne-hermes install --mode wrapper --python
-# <standalone-venv-python> --no-bootstrap` (all three flags confirmed live
-# against `mnemosyne-hermes install --help`). This is the tool's own
-# documented mechanism for exactly this situation — installing from a
-# separate/persistent venv without needing write access to Hermes's own
-# venv — and sidesteps two real problems we previously worked around
-# reactively: (1) Hermes's venv here is uv-managed and PEP 668
-# externally-managed, so the default ("symlink") mode's own internal
-# auto-bootstrap into Hermes's venv fails outright without
-# --break-system-packages, which the tool doesn't pass on its own; and
-# (2) that same auto-bootstrap always requests mnemosyne-hermes[all],
-# regardless of MNEMOSYNE_INSTALL_PROFILE, silently ignoring the profile
-# choice below. --mode wrapper avoids needing to touch Hermes's venv at
-# all, and --no-bootstrap guarantees the profile-ignorant auto-bootstrap
-# path is never triggered as a side effect.
+# Registration uses `mnemosyne-hermes install --mode wrapper --python
+# <standalone-venv-python> --no-bootstrap`: creates a persistent shim
+# under Hermes's plugins directory that imports mnemosyne_hermes from our
+# standalone venv, so nothing needs installing into Hermes's own venv.
+# --no-bootstrap guarantees the tool's own profile-ignorant auto-bootstrap
+# never fires as a side effect.
 #
 # The platform/.hermes/config.yaml bootstrap must set:
 #   memory:
@@ -1364,32 +1219,21 @@ ensure_venv_ensurepip_support() {
 #     user_profile_enabled: false  — disables built-in USER.md injection
 #     provider: mnemosyne
 #
-# IMPORTANT: do NOT use `hermes tools disable memory` — that also kills all
-# 25 Mnemosyne-registered tools (the "memory" toolset key gates both the
-# built-in tool and memory provider tools). Use memory_enabled: false in
-# config.yaml instead.
+# IMPORTANT: do NOT use `hermes tools disable memory` — that also kills
+# all Mnemosyne-registered tools. Use memory_enabled: false instead.
 #
-# MNEMOSYNE_HOST_LLM_ENABLED routes consolidation LLM calls through Hermes's
-# own authenticated provider — no separate API key needed. It does NOT
-# cover embeddings (text-in/vector-out is a different API surface most
-# chat providers don't expose) — embeddings still need either a local
-# model (embeddings/all profile) or MNEMOSYNE_EMBEDDING_API_URL pointed
-# at a real embeddings endpoint.
-# This env var belongs in ~/.hermes/.env (read by Hermes at startup), NOT
-# in the AaaS platform .env (only read by watchdog/opencode).
+# MNEMOSYNE_HOST_LLM_ENABLED routes consolidation LLM calls through
+# Hermes's own authenticated provider — no separate API key needed. Does
+# NOT cover embeddings; those need a local model (embeddings/all profile)
+# or MNEMOSYNE_EMBEDDING_API_URL.
 #
 # Data lives at ~/.hermes/mnemosyne/data/ (upstream default).
 #
-# Install profile is controlled by MNEMOSYNE_INSTALL_PROFILE env var:
-#   unset / ""   → embeddings (default — local fastembed model, ~800 MB,
-#                  needed for working semantic recall out of the box
-#                  without wiring up a separate external embeddings API)
-#   "embeddings" → same as default, explicit
-#   "all"        → mnemosyne-memory[all] (~1.5 GB, needs 8 GB+ free RAM,
-#                  adds local LLM via llama-cpp-python)
-#   (empty/core is only reachable by unsetting the default logic below;
-#    core has NO local embedding backend — semantic recall requires
-#    MNEMOSYNE_EMBEDDING_API_URL to be set separately, or degrades)
+# Install profile via MNEMOSYNE_INSTALL_PROFILE env var:
+#   unset / "embeddings" → local fastembed model, ~800 MB (default)
+#   "all"                → mnemosyne-memory[all], ~1.5 GB, 8 GB+ RAM
+#   (empty/core has no local embedding backend — needs
+#    MNEMOSYNE_EMBEDDING_API_URL or semantic recall degrades)
 # ---------------------------------------------------------------------------
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
@@ -1399,19 +1243,11 @@ install_mnemosyne() {
   local hermes_env="${AAAS_HOME}/.hermes/.env"
   local profile="${MNEMOSYNE_INSTALL_PROFILE:-embeddings}"
 
-  # ------------------------------------------------------------------
-  # 1. Create a standalone venv dedicated to Mnemosyne, fully separate
-  #    from Hermes's own managed venv (${AAAS_HOME}/.hermes/hermes-agent/venv).
-  #    `hermes update` rebuilds that managed venv and wipes any extra
-  #    packages installed into it, so Mnemosyne must never live there.
-  #
-  #    Idempotency guard: a venv is only "already good" if pip actually
-  #    works in it. A prior failed attempt (e.g. missing ensurepip) can
-  #    leave a venv_dir with bin/python3 present but no working pip —
-  #    don't treat that as done, wipe and recreate.
-  # ------------------------------------------------------------------
   ensure_venv_ensurepip_support
 
+  # Idempotency guard: a venv only counts as "already good" if pip
+  # actually works in it — a prior failed attempt can leave bin/python3
+  # present but no working pip.
   if [[ -x "$venv_python" ]] && run_as_aaas "$venv_python" -m pip --version >/dev/null 2>&1; then
     ok "Mnemosyne standalone venv already exists and has working pip at ${mnemosyne_venv}."
   else
@@ -1429,11 +1265,6 @@ install_mnemosyne() {
 
   run_as_aaas "$venv_python" -m pip install --quiet --upgrade pip
 
-  # ------------------------------------------------------------------
-  # 2. Install mnemosyne-hermes (the Hermes plugin wrapper) plus the
-  #    chosen mnemosyne-memory profile into the standalone venv —
-  #    never into Hermes's own managed venv.
-  # ------------------------------------------------------------------
   local core_pkg
   if [[ -n "$profile" ]]; then
     core_pkg="mnemosyne-memory[${profile}]"
@@ -1442,8 +1273,6 @@ install_mnemosyne() {
   fi
 
   local installed_core_ver installed_hermes_ver
-  # `pip show` exits non-zero when the package is absent; || true prevents
-  # that from tripping set -e before we even reach the install step.
   installed_core_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-memory 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
   installed_hermes_ver="$(run_as_aaas "$venv_python" -m pip show mnemosyne-hermes 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
 
@@ -1455,53 +1284,15 @@ install_mnemosyne() {
     ok "Installed ${core_pkg} and mnemosyne-hermes into ${mnemosyne_venv}."
   fi
 
-  # ------------------------------------------------------------------
-  # 3. Register the plugin with Hermes using mnemosyne-hermes's own
-  #    installer, run from the standalone venv, in WRAPPER mode.
-  #
-  #    Verified directly against `mnemosyne-hermes install --help` and
-  #    `mnemosyne-hermes --help`: this is a real, documented CLI, not a
-  #    guess. Default ("symlink") mode requires mnemosyne-hermes to be
-  #    importable from WITHIN Hermes's own venv, and auto-bootstraps
-  #    itself there if not — which fails under Hermes's uv-managed,
-  #    PEP-668-externally-managed venv (needs --break-system-packages,
-  #    which the tool's own auto-bootstrap doesn't pass), and even when
-  #    worked around, always installs mnemosyne-hermes[all] regardless
-  #    of our chosen profile.
-  #
-  #    --mode wrapper --python <our venv's python> avoids all of that:
-  #    it creates a persistent shim under Hermes's plugins directory that
-  #    imports mnemosyne_hermes from OUR standalone venv, so nothing ever
-  #    needs to be installed into Hermes's own venv at all.
-  #    --no-bootstrap additionally guarantees the tool never attempts
-  #    its own (profile-ignorant) auto-bootstrap into Hermes's venv as a
-  #    side effect, regardless of mode.
-  # ------------------------------------------------------------------
   run_as_aaas "${mnemosyne_venv}/bin/mnemosyne-hermes" \
     --hermes-home "${AAAS_HOME}/.hermes" \
     install --force --no-bootstrap --mode wrapper --python "$venv_python" \
     || fail "mnemosyne-hermes install --mode wrapper failed. Run 'sudo -u ${AAAS_USER} ${mnemosyne_venv}/bin/mnemosyne-hermes --hermes-home ${AAAS_HOME}/.hermes install --dry-run --mode wrapper --python ${venv_python}' to inspect."
   ok "Registered the mnemosyne plugin with Hermes (wrapper mode, no changes made to Hermes's own venv)."
 
-  # ------------------------------------------------------------------
-  # 4. Register mnemosyne as the active memory provider.
-  #    `hermes config set` writes memory.provider: mnemosyne into
-  #    ~/.hermes/config.yaml without requiring an interactive session.
-  # ------------------------------------------------------------------
   run_as_aaas bash -li -c "hermes config set memory.provider mnemosyne"
   ok "memory.provider set to mnemosyne in Hermes config."
 
-  # ------------------------------------------------------------------
-  # 5. Write MNEMOSYNE_HOST_LLM_ENABLED to ~/.hermes/.env.
-  #    This routes Mnemosyne's consolidation and fact-extraction LLM
-  #    calls through Hermes's own authenticated provider, so no
-  #    separate API key is needed for memory operations. It does NOT
-  #    cover embeddings — see the profile note above.
-  #
-  #    ~/.hermes/.env is the correct location — Hermes reads it at
-  #    startup. The AaaS platform .env (CONFIG_FILE) is only consumed
-  #    by the watchdog and opencode, not by Hermes itself.
-  # ------------------------------------------------------------------
   if grep -Fq "MNEMOSYNE_HOST_LLM_ENABLED" "$hermes_env" 2>/dev/null; then
     ok "MNEMOSYNE_HOST_LLM_ENABLED already set in ${hermes_env}."
   else
@@ -1509,7 +1300,6 @@ install_mnemosyne() {
     ok "MNEMOSYNE_HOST_LLM_ENABLED=true written to ${hermes_env}."
   fi
 
-  # Re-lock ownership/permissions on .env after writing.
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "$hermes_env"
   run $SUDO chmod 660 "$hermes_env"
 
@@ -1524,19 +1314,15 @@ install_mnemosyne() {
 write_watchdog() {
   step "Creating the watchdog"
 
-  # Watchdog script runs as the aaas user (enforced by the systemd unit).
-  # No sudo needed inside for file ops: aaas owns every file it touches.
-  # systemctl start/restart/is-active on the Hermes gateway unit DO need
-  # sudo (see ensure_watchdog_systemctl_sudo() for the scoped NOPASSWD
-  # grant that makes this work non-interactively).
+  # Watchdog script runs as aaas (enforced by the systemd unit). No sudo
+  # needed inside for file ops. systemctl start/restart/is-active on the
+  # gateway unit DO need sudo — see ensure_watchdog_systemctl_sudo().
   run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.sh'" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLATFORM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-# Watchdog's own env file, separate from the platform .env and from
-# Hermes's ~/.hermes/.env. Currently holds only HERMES_GATEWAY_UNIT.
 CONFIG_FILE="${SCRIPT_DIR}/.env"
 ALERT_DIR="${SCRIPT_DIR}/alerts"
 LOG_FILE="${SCRIPT_DIR}/watchdog.log"
@@ -1551,25 +1337,17 @@ log() {
   printf "[%s] %s\n" "$(stamp)" "$*" >>"$LOG_FILE"
 }
 
-# ---------------------------------------------------------------------------
 # alert <alert_code> <message> [key: value ...]
 #
 # Generic, target-agnostic alert dispatcher. Writes a structured alert.txt
-# into a unique timestamped folder and hands the folder off to opencode,
-# which routes to the matching "<alert_code>-recovery" skill via the
+# into a unique timestamped folder and hands the folder to opencode, which
+# routes to the matching "<alert_code>-recovery" skill via the
 # watchdog-alert skill. Any future watchdog check (docker engine, disk
-# space, mnemosyne reachability, etc.) reuses this same function — nothing
-# here is gateway-specific.
+# space, etc.) reuses this same function unchanged.
 #
-# alert_code must match the "<alert_code>-recovery" skill name under
-# .opencode/skills/ exactly (e.g. "hermes-gateway" -> hermes-gateway-recovery).
-#
-# Extra key/value pairs are optional, freeform context for the recovery
-# skill (e.g. "gateway_unit: hermes-gateway.service"). Each must already be
-# a single "key: value" line — this function does no quoting/escaping of
-# them, so callers should keep values simple (no embedded newlines/colons
-# in the key itself).
-# ---------------------------------------------------------------------------
+# alert_code must match the "<alert_code>-recovery" skill name exactly
+# (e.g. "hermes-gateway" -> hermes-gateway-recovery). Extra key/value pairs
+# are freeform context for the recovery skill (e.g. "gateway_unit: ...").
 alert() {
   local alert_code="$1"
   local message="$2"
@@ -1591,10 +1369,8 @@ alert() {
   log "[$alert_code] $message"
 
   if command -v opencode >/dev/null 2>&1; then
-    # The prompt deliberately carries no alert-specific detail at all — the
-    # watchdog-alert skill reads everything it needs (alert_code, message,
-    # and any extra fields) straight out of alert.txt. This keeps alert()
-    # itself, and this invocation, identical no matter what target failed.
+    # No alert-specific detail in the prompt — the watchdog-alert skill
+    # reads everything it needs straight out of alert.txt.
     (cd "$PLATFORM_DIR" && opencode run "AaaS watchdog alert. Alert folder: ${alert_path}. Use the watchdog-alert skill.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
@@ -1604,26 +1380,16 @@ process_running() {
 }
 
 # HERMES_GATEWAY_UNIT is written into CONFIG_FILE by install.sh's
-# persist_hermes_gateway_unit(); it's the exact systemd unit name that
-# `hermes gateway install --system` generated. We control it via plain
-# systemctl, NOT the `hermes` CLI — the hermes CLI's own guard wrapper
-# (/usr/local/bin/hermes, blocks anyone who isn't aaas) and the --system
-# subcommands' root requirement can never both be satisfied by a single
-# process, which produced a real, reproducible ping-pong failure in
-# practice: `hermes gateway restart` -> blocked (not aaas) ->
-# `sudo hermes gateway restart` -> blocked by the wrapper (root isn't
-# aaas) -> `sudo -u aaas hermes gateway restart` -> passes the wrapper,
-# but aaas isn't root, so the systemd-control step itself then fails.
-# systemctl sidesteps this entirely: the unit's own User=aaas directive
-# execs the process as aaas at the OS level, never touching the wrapper
-# or the hermes CLI's own logic at all. The matching NOPASSWD sudoers
-# grant is installed by ensure_watchdog_systemctl_sudo() in install.sh,
-# scoped to exactly this unit name.
+# persist_hermes_gateway_unit(). Controlled via plain systemctl, not the
+# `hermes` CLI — the hermes CLI's guard wrapper (blocks non-aaas) and the
+# --system subcommands' root requirement can never both be satisfied by a
+# single process. systemctl sidesteps this: the unit's own User=aaas
+# directive execs the process as aaas at the OS level. Matching NOPASSWD
+# sudoers grant installed by ensure_watchdog_systemctl_sudo() in install.sh.
 if [[ -z "${HERMES_GATEWAY_UNIT:-}" ]]; then
   alert "hermes-gateway" "HERMES_GATEWAY_UNIT is not set in ${CONFIG_FILE}; rerun install.sh to regenerate it"
   exit 1
 fi
-
 
 if sudo -n systemctl is-active --quiet "$HERMES_GATEWAY_UNIT"; then
   log "Hermes gateway system service is healthy."
@@ -1639,9 +1405,8 @@ if sudo -n systemctl restart "$HERMES_GATEWAY_UNIT" >>"$LOG_FILE" 2>&1; then
   fi
 fi
 
-# The direct restart attempt failed or didn't stick — hand off to opencode,
-# which follows the hermes-gateway-recovery skill for further remediation
-# (log inspection, container/docker checks, etc.) rather than looping here.
+# Direct restart failed or didn't stick — hand off to opencode, which
+# follows the hermes-gateway-recovery skill for further remediation.
 alert "hermes-gateway" \
   "Hermes gateway system service failed to start via 'sudo systemctl restart \"$HERMES_GATEWAY_UNIT\"'" \
   "gateway_unit: $HERMES_GATEWAY_UNIT"
@@ -1651,7 +1416,7 @@ EOF
   run $SUDO chmod +x "${WATCHDOG_DIR}/watchdog.sh"
   run $SUDO chown "$AAAS_USER:$AAAS_GROUP" "${WATCHDOG_DIR}/watchdog.sh"
 
-  # systemd unit: runs as aaas:aaas — no sudo needed inside the script.
+  # systemd unit runs as aaas:aaas — no sudo needed inside the script.
   run_as_aaas bash -c "cat > '${WATCHDOG_DIR}/watchdog.service'" <<EOF
 [Unit]
 Description=AaaS Hermes watchdog
@@ -1676,113 +1441,9 @@ EOF
   ok "Optional systemd unit written to ${WATCHDOG_DIR}/watchdog.service."
 }
 
-# ---------------------------------------------------------------------------
-# Centralized placeholder resolution for every synced platform bootstrap
-# file. Add a new placeholder ONCE, to PLATFORM_PLACEHOLDERS, and it is
-# resolved automatically in every registered file below — no per-file sed
-# invocation needs to be written each time a new bootstrap file is added.
-#
-# Two file registries:
-#   PLATFORM_PLACEHOLDER_FILES_REQUIRED — must exist; install.sh fails
-#     loudly if missing, since core platform functionality depends on
-#     them (e.g. the opencode recovery skill).
-#   PLATFORM_PLACEHOLDER_FILES_OPTIONAL — user-supplied staging files that
-#     may legitimately be absent (e.g. no .hermes/config.yaml bootstrap
-#     was provided for this install); skipped with a warn, not a fail.
-#
-# To add a new bootstrap file in future: add its path to one of the two
-# arrays below. To add a new placeholder token: add one line to
-# init_platform_placeholders(). No other code changes needed.
-# ---------------------------------------------------------------------------
-
-declare -A PLATFORM_PLACEHOLDERS=()
-
-# Populate the placeholder map. Must run after ensure_aaas_user, since
-# AAAS_HOME is only resolved there.
-init_platform_placeholders() {
-  PLATFORM_PLACEHOLDERS=(
-    [__PLATFORM_DIR__]="$PLATFORM_DIR"
-    [__HERMES_HOME__]="${AAAS_HOME}/.hermes"
-    [__AAAS_USER__]="$AAAS_USER"
-    [__AAAS_GROUP__]="$AAAS_GROUP"
-    [__ROOT_DIR__]="$ROOT_DIR"
-    [__CONFIG_FILE__]="$CONFIG_FILE"
-    [__WATCHDOG_DIR__]="$WATCHDOG_DIR"
-    [__WATCHDOG_ENV_FILE__]="$WATCHDOG_ENV_FILE"
-    [__ALERT_DIR__]="$ALERT_DIR"
-  )
-}
-
-# Files that MUST exist for the platform to function correctly.
-PLATFORM_PLACEHOLDER_FILES_REQUIRED=(
-  "${PLATFORM_DIR}/.opencode/skills/hermes-gateway-recovery/SKILL.md"
-)
-
-# User-supplied staging/bootstrap files that may legitimately be absent.
-PLATFORM_PLACEHOLDER_FILES_OPTIONAL=(
-  "${PLATFORM_DIR}/.hermes/config.yaml"
-)
-
-# resolve_one_placeholder_file — apply the shared placeholder map to a
-# single file, in place, idempotently. Skips the sed pass entirely if no
-# registered placeholder token remains in the file (already resolved, or
-# never had any), rather than re-running sed against already-resolved text.
-resolve_one_placeholder_file() {
-  local file="$1"
-  local token pattern="" sed_args=()
-
-  for token in "${!PLATFORM_PLACEHOLDERS[@]}"; do
-    pattern="${pattern:+${pattern}|}${token}"
-  done
-
-  if ! grep -qE "$pattern" "$file"; then
-    ok "No unresolved placeholders in ${file}; leaving as-is."
-    return
-  fi
-
-  for token in "${!PLATFORM_PLACEHOLDERS[@]}"; do
-    # sed's delimiter is | since substituted values (paths) may contain /.
-    sed_args+=(-e "s|${token}|${PLATFORM_PLACEHOLDERS[$token]}|g")
-  done
-
-  run_as_aaas sed -i "${sed_args[@]}" "$file"
-  ok "Resolved placeholders in ${file}."
-}
-
-# resolve_platform_placeholders — single entry point. Validates required
-# files exist (fails loudly if not), skips missing optional files with a
-# warn, and applies the shared placeholder map to whichever files are
-# present. Call once, after sync_platform_files, before anything that
-# consumes these files (e.g. write_hermes_config_yaml, opencode).
-resolve_platform_placeholders() {
-  step "Resolving platform bootstrap placeholders"
-
-  init_platform_placeholders
-
-  local file
-
-  for file in "${PLATFORM_PLACEHOLDER_FILES_REQUIRED[@]}"; do
-    [[ -f "$file" ]] || fail "Required bootstrap file is missing: ${file}. Add it to the aaas repo under platform/."
-    resolve_one_placeholder_file "$file"
-  done
-
-  for file in "${PLATFORM_PLACEHOLDER_FILES_OPTIONAL[@]}"; do
-    if [[ ! -f "$file" ]]; then
-      ok "Optional bootstrap file not present, skipping: ${file}"
-      continue
-    fi
-    resolve_one_placeholder_file "$file"
-  done
-
-  # Re-lock ownership across everything this touched.
-  run $SUDO chown -R "$AAAS_USER:$AAAS_GROUP" "$PLATFORM_DIR"
-}
-
-# ---------------------------------------------------------------------------
 # resolve_hermes_gateway_unit_name — find the systemd unit name that
-# `hermes gateway install --system` generated. Factored out since both
-# configure_hermes_gateway_service_env and verify_hermes_runtime need it.
-# ---------------------------------------------------------------------------
+# `hermes gateway install --system` generated. Shared by
+# configure_hermes_gateway_service_env and verify_hermes_runtime.
 resolve_hermes_gateway_unit_name() {
   $SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null \
     | awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }'
@@ -1802,12 +1463,11 @@ configure_hermes_gateway_service_env() {
   dropin_file="${dropin_dir}/aaas.conf"
 
   run $SUDO mkdir -p "$dropin_dir"
-  # Run the gateway as aaas:aaas. With User=aaas set, systemd resolves $HOME
+  # Run the gateway as aaas:aaas. With User=aaas, systemd resolves $HOME
   # from /etc/passwd automatically, so Hermes finds ~/.hermes/.env at its
-  # own default location without any extra environment variables. Do NOT
-  # add an EnvironmentFile= here: neither the platform .env nor the
-  # watchdog's env file belong in the gateway's process environment —
-  # Hermes reads its own .env directly, and always should.
+  # default location without any extra env vars. Do NOT add an
+  # EnvironmentFile= here — neither the platform .env nor the watchdog's
+  # env file belong in the gateway's process environment.
   printf "[Service]\nUser=%s\nGroup=%s\n" \
     "$AAAS_USER" "$AAAS_GROUP" \
     | $SUDO tee "$dropin_file" >/dev/null
@@ -1815,33 +1475,13 @@ configure_hermes_gateway_service_env() {
   ok "Hermes gateway service ${unit_name} pinned to ${AAAS_USER}:${AAAS_GROUP} (reads its own ~/.hermes/.env; no EnvironmentFile override)."
 }
 
-# ---------------------------------------------------------------------------
 # persist_hermes_gateway_unit — write HERMES_GATEWAY_UNIT into
-# WATCHDOG_ENV_FILE (the watchdog's own env file, not the platform
-# CONFIG_FILE and not Hermes's ~/.hermes/.env) so watchdog.sh, the opencode
-# recovery skill, and summary() can all reference the resolved unit name
-# directly via `systemctl <verb> <unit>`, without re-discovering it or
-# going through the `hermes` CLI/guard wrapper.
-#
-# Why systemctl, not the hermes CLI, for restart/health-check: the guard
-# wrapper at /usr/local/bin/hermes blocks anyone who isn't aaas, but
-# --system gateway control needs root — a single process can never satisfy
-# both simultaneously. In practice this produces exactly the ping-pong
-# reported against a live deployment: `hermes gateway restart` (blocked,
-# not aaas) -> `sudo hermes gateway restart` (blocked by wrapper, root
-# isn't aaas) -> `sudo -u aaas hermes gateway restart` (passes the wrapper,
-# but aaas isn't root, so the systemd-control step itself then fails).
-# `sudo systemctl restart <unit>` sidesteps all of this: systemd's own
-# User=aaas directive in the unit (see configure_hermes_gateway_service_env)
-# execs the process as aaas at the OS level, never touching the wrapper or
-# the hermes CLI's own logic at all — confirmed as the reliable path in
-# practice, and now the primary mechanism used throughout install.sh.
-# ---------------------------------------------------------------------------
+# WATCHDOG_ENV_FILE so watchdog.sh, the recovery skill, and summary() can
+# all reference the resolved unit name via `systemctl <verb> <unit>`,
+# without going through the hermes CLI/guard wrapper.
 persist_hermes_gateway_unit() {
   local unit_name="$1"
 
-  # Ensure the watchdog's own env file exists before writing to it — it's
-  # never pre-created elsewhere, unlike the platform CONFIG_FILE.
   if [[ ! -f "$WATCHDOG_ENV_FILE" ]]; then
     run_as_aaas bash -c "cat > '${WATCHDOG_ENV_FILE}'" <<EOF
 # Generated by install.sh — watchdog-only settings.
@@ -1850,8 +1490,6 @@ persist_hermes_gateway_unit() {
 EOF
   fi
 
-  # Idempotent: replace any existing HERMES_GATEWAY_UNIT line rather than
-  # appending a duplicate on rerun.
   if grep -q '^HERMES_GATEWAY_UNIT=' "$WATCHDOG_ENV_FILE" 2>/dev/null; then
     run_as_aaas sed -i "s|^HERMES_GATEWAY_UNIT=.*|HERMES_GATEWAY_UNIT=${unit_name}|" "$WATCHDOG_ENV_FILE"
   else
@@ -1886,9 +1524,8 @@ verify_hermes_runtime() {
     [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Installing the Hermes gateway system service requires root or sudo."
     [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before verify_hermes_runtime."
 
-    # gateway install itself still needs the real binary directly (it's a
-    # one-time setup/generation step, not the restart path this feedback
-    # is about) — bypassing the wrapper guard, which blocks non-aaas.
+    # gateway install is a one-time setup step — bypasses the wrapper
+    # guard directly, since it needs the real binary.
     run $SUDO "$HERMES_REAL_BIN" gateway install --system
     configure_hermes_gateway_service_env
 
@@ -1897,10 +1534,10 @@ verify_hermes_runtime() {
     [[ -n "$unit_name" ]] || fail "Could not resolve the Hermes gateway systemd unit name after install."
     persist_hermes_gateway_unit "$unit_name"
     ensure_watchdog_systemctl_sudo "$unit_name"
-    resolve_late_bound_gateway_unit_placeholder "$unit_name"
+    resolve_gateway_unit_placeholder "$unit_name"
 
-    # Health-check and start/restart via systemctl directly, not the hermes
-    # CLI — see persist_hermes_gateway_unit's docstring for why.
+    # Health-check and start/restart via systemctl directly, not the
+    # hermes CLI — see the wrapper-vs-root note above.
     if ! $SUDO systemctl is-active --quiet "$unit_name"; then
       run $SUDO systemctl start "$unit_name"
     else
@@ -1992,20 +1629,14 @@ summary() {
   printf "     recall) — then rerun install.sh.\n"
   printf "\n"
   printf "%sHermes gateway note:%s\n" "${BOLD}" "${RESET}"
-  printf "  The gateway is installed as a systemd system service, which means it\n"
-  printf "  starts automatically at boot and runs independently of any user session.\n"
-  printf "  This is intentional for a server deployment — ignore any Hermes prompt\n"
-  printf "  suggesting a switch to a per-user service.\n"
+  printf "  The gateway is installed as a systemd system service — starts at boot,\n"
+  printf "  runs independently of any user session. Intentional for a server\n"
+  printf "  deployment; ignore any Hermes prompt suggesting a per-user service.\n"
   printf "\n"
   printf "%sManual gateway restarts:%s\n" "${BOLD}" "${RESET}"
   printf "  Use systemctl directly, NOT the 'hermes' CLI. The 'hermes' command on PATH\n"
   printf "  is a guard wrapper that blocks anyone who isn't %s, including root — but\n" "$AAAS_USER"
-  printf "  gateway control needs root, and a single process can't be both at once.\n"
-  printf "  In practice this produces a real ping-pong: plain 'hermes gateway restart'\n"
-  printf "  is blocked (not %s); 'sudo hermes gateway restart' is blocked too (root\n" "$AAAS_USER"
-  printf "  isn't %s); 'sudo -u %s hermes gateway restart' passes the wrapper but then\n" "$AAAS_USER" "$AAAS_USER"
-  printf "  fails needing root. systemctl sidesteps all of this — the unit's own\n"
-  printf "  User=%s directive execs the process correctly at the OS level:\n" "$AAAS_USER"
+  printf "  gateway control needs root, and a single process can't be both at once:\n"
   printf "    ${BOLD}sudo systemctl restart %s${RESET}\n" "$(config_value HERMES_GATEWAY_UNIT "$WATCHDOG_ENV_FILE")"
   printf "  The watchdog service (aaas-watchdog.service) already does this automatically\n"
   printf "  via a scoped NOPASSWD sudoers rule at /etc/sudoers.d/aaas-hermes-gateway-systemctl,\n"
@@ -2019,21 +1650,28 @@ main() {
   # --- Service account & filesystem layout ---------------------------------
   install_base_packages
   ensure_aaas_user            # must run first: resolves AAAS_HOME
-  build_bootstrap_placeholder_table  # depends on AAAS_HOME from ensure_aaas_user
-  provision_aaas_directories  # depends on AAAS_HOME from ensure_aaas_user
-  ensure_aaas_profile         # must run before install_hermes
+  build_bootstrap_placeholder_table
+  provision_aaas_directories
+  ensure_aaas_profile          # must run before install_hermes
 
   # --- Platform source & core dependencies ----------------------------------
   sync_platform_files
-  validate_mandatory_bootstrap_files   # fail fast if required repo files are missing
-  resolve_all_bootstrap_placeholders   # __PLACEHOLDER__ substitution, once, for every listed file
+  validate_mandatory_bootstrap_files
   install_node
   install_opencode
   install_python_yaml
   install_docker
+  install_hermes                # binary only — no platform config applied yet
 
-  # --- Hermes runtime & Mnemosyne memory -------------------------------------
-  install_hermes
+  # --- Platform configuration -------------------------------------------------
+  # Placeholders resolved once, right before the files that need them are
+  # actually consumed (config.yaml/SOUL.md by configure_hermes_platform).
+  # __HERMES_GATEWAY_UNIT__ is the one exception — its value doesn't exist
+  # until verify_hermes_runtime, so it's resolved separately there.
+  resolve_all_bootstrap_placeholders
+  configure_hermes_platform
+
+  # --- Mnemosyne memory ---------------------------------------------------------
   ensure_watchdog_sudo         # needs HERMES_REAL_BIN from install_hermes
   install_mnemosyne
 
