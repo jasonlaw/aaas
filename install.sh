@@ -1339,9 +1339,18 @@ write_watchdog() {
 # resolve_hermes_gateway_unit_name — find the systemd unit name that
 # `hermes gateway install --system` generated. Shared by
 # configure_hermes_gateway_service_env and verify_hermes_runtime.
+#
+# Captures systemctl's output into a variable first, then feeds it to awk
+# via a here-string rather than a live pipe. Piping directly into
+# `awk '{ ...; exit }'` is racy under `set -o pipefail`: awk's early exit
+# can close the pipe while systemctl is still writing, killing it with
+# SIGPIPE — a non-zero exit status that pipefail then blames on the whole
+# pipeline, even though awk already got the answer. Capturing first avoids
+# a live producer/consumer pipe entirely.
 resolve_hermes_gateway_unit_name() {
-  $SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null \
-    | awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }'
+  local unit_files
+  unit_files="$($SUDO systemctl list-unit-files --type=service --no-legend 2>/dev/null || true)"
+  awk '$1 ~ /hermes/ && $1 ~ /gateway/ { print $1; exit }' <<<"$unit_files"
 }
 
 configure_hermes_gateway_service_env() {
