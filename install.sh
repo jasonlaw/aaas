@@ -1344,7 +1344,19 @@ install_mnemosyne() {
   local hermes_env="${AAAS_HOME}/.hermes/.env"
   local profile="${MNEMOSYNE_INSTALL_PROFILE:-embeddings}"
 
-  ensure_venv_ensurepip_support
+  # Create mnemosyne-venv with the SAME Python binary Hermes's own venv
+  # uses, not whatever system python3 happens to resolve to. Different
+  # Python versions between the two venvs means C-extensions (numpy, etc.)
+  # built for one won't load if imported from the other — the actual root
+  # cause behind ensure_mnemosyne_plugin_syspath_priority's symptom.
+  local hermes_venv_python="${AAAS_HOME}/.hermes/hermes-agent/venv/bin/python"
+  local venv_creator="python3"
+  if [[ -x "$hermes_venv_python" ]]; then
+    venv_creator="$hermes_venv_python"
+  else
+    warn "Hermes's own venv Python not found at ${hermes_venv_python}; falling back to system python3 for mnemosyne-venv. Versions may drift — rerun install.sh once Hermes is installed if this warning appears unexpectedly."
+    ensure_venv_ensurepip_support
+  fi
 
   # Idempotency guard: a venv only counts as "already good" if pip
   # actually works in it — a prior failed attempt can leave bin/python3
@@ -1357,11 +1369,11 @@ install_mnemosyne() {
       run_as_aaas rm -rf "$mnemosyne_venv"
     fi
     install_banner "mnemosyne standalone venv"
-    run_as_aaas python3 -m venv "$mnemosyne_venv" \
+    run_as_aaas "$venv_creator" -m venv "$mnemosyne_venv" \
       || fail "Failed to create venv at ${mnemosyne_venv} even after installing venv support."
     run_as_aaas "$venv_python" -m ensurepip --upgrade \
-      || fail "python3 -m venv succeeded but ensurepip still failed inside ${mnemosyne_venv}. Check python3-venv / python3-pip installation."
-    ok "Created standalone venv at ${mnemosyne_venv}."
+      || fail "venv creation succeeded but ensurepip still failed inside ${mnemosyne_venv}. Check python3-venv / python3-pip installation."
+    ok "Created standalone venv at ${mnemosyne_venv} using ${venv_creator}."
   fi
 
   run_as_aaas "$venv_python" -m pip install --quiet --upgrade pip
