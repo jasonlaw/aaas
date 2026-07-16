@@ -39,3 +39,7 @@ gateway:
   platforms:
     telegram:
       enabled: true
+
+# @default
+stt:
+  provider: local      

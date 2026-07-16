@@ -1296,6 +1296,46 @@ ensure_venv_ensurepip_support() {
 #   (empty/core has no local embedding backend — needs
 #    MNEMOSYNE_EMBEDDING_API_URL or semantic recall degrades)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ensure_mnemosyne_plugin_syspath_priority — mnemosyne-hermes's wrapper-mode
+# plugin puts mnemosyne-venv's site-packages at sys.path position 0, so any
+# Hermes-venv import (e.g. faster-whisper's `import numpy`) can resolve to
+# mnemosyne-venv's numpy instead — a different Python version's
+# C-extensions, which then fail to load. Rewrites insert(0, ...) to
+# append(...) so the Hermes venv keeps import priority. `mnemosyne-hermes
+# install --force` regenerates this file every run, so this must reapply
+# every run too, not just once.
+# ---------------------------------------------------------------------------
+ensure_mnemosyne_plugin_syspath_priority() {
+  local plugin_init="${AAAS_HOME}/.hermes/plugins/mnemosyne/__init__.py"
+
+  if [[ ! -f "$plugin_init" ]]; then
+    warn "Mnemosyne plugin __init__.py not found at ${plugin_init}; skipping sys.path priority fix."
+    return 0
+  fi
+
+  if ! grep -qE '\.path\.insert\(\s*0\s*,' "$plugin_init"; then
+    ok "Mnemosyne plugin does not insert at sys.path position 0; no fix needed."
+    return 0
+  fi
+
+  run_as_aaas python3 - "$plugin_init" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    text = f.read()
+
+fixed = re.sub(r'\.path\.insert\(\s*0\s*,\s*(.+?)\)', r'.path.append(\1)', text)
+
+with open(path, "w") as f:
+    f.write(fixed)
+PYEOF
+
+  ok "Patched ${plugin_init}: sys.path.insert(0, ...) -> append(...) so the Hermes venv keeps import priority."
+}
+
 install_mnemosyne() {
   step "Installing Mnemosyne memory provider"
 
@@ -1350,6 +1390,7 @@ install_mnemosyne() {
     install --force --no-bootstrap --mode wrapper --python "$venv_python" \
     || fail "mnemosyne-hermes install --mode wrapper failed. Run 'sudo -u ${AAAS_USER} ${mnemosyne_venv}/bin/mnemosyne-hermes --hermes-home ${AAAS_HOME}/.hermes install --dry-run --mode wrapper --python ${venv_python}' to inspect."
   ok "Registered the mnemosyne plugin with Hermes (wrapper mode, no changes made to Hermes's own venv)."
+  ensure_mnemosyne_plugin_syspath_priority
 
   run_as_aaas bash -li -c "hermes config set memory.provider mnemosyne"
   ok "memory.provider set to mnemosyne in Hermes config."
@@ -1370,6 +1411,36 @@ install_mnemosyne() {
   warn "  sudo -u ${AAAS_USER} ${mnemosyne_venv}/bin/mnemosyne-hermes --hermes-home ${AAAS_HOME}/.hermes status"
   warn "  sudo -u ${AAAS_USER} hermes mnemosyne stats"
   warn "  sudo -u ${AAAS_USER} hermes doctor | grep -A5 'Memory Provider'   # (unconfirmed grep pattern — check actual doctor output if this doesn't match)"
+}
+
+# ---------------------------------------------------------------------------
+# ensure_hermes_stt_numpy_compat — secondary safety net alongside
+# ensure_mnemosyne_plugin_syspath_priority. That fix addresses the actual
+# root cause (mnemosyne-venv's numpy shadowing Hermes venv's own); this
+# reinstalls numpy/faster-whisper directly against Hermes's own Python in
+# case the venv's own numpy build is itself stale or mismatched.
+#
+# Only acts if faster-whisper is already present — skip if STT isn't in
+# use. `hermes update` rebuilds this venv, so this needs rerunning after
+# any update.
+# ---------------------------------------------------------------------------
+ensure_hermes_stt_numpy_compat() {
+  step "Checking Hermes STT (numpy/faster-whisper) compatibility"
+
+  local hermes_venv_python="${AAAS_HOME}/.hermes/hermes-agent/venv/bin/python"
+
+  if [[ ! -x "$hermes_venv_python" ]]; then
+    warn "Hermes managed venv not found at ${hermes_venv_python}; skipping the numpy compatibility check."
+    return 0
+  fi
+
+  if ! run_as_aaas "$hermes_venv_python" -m pip show faster-whisper >/dev/null 2>&1; then
+    ok "faster-whisper is not installed; nothing to fix."
+    return 0
+  fi
+
+  run_as_aaas "$hermes_venv_python" -m pip install --quiet --force-reinstall 'numpy<2' faster-whisper
+  ok "Reinstalled numpy<2 and faster-whisper against Hermes's own Python (fixes C-extension version mismatches)."
 }
 
 write_watchdog() {
@@ -1636,6 +1707,7 @@ main() {
   # --- Mnemosyne memory ---------------------------------------------------------
   ensure_watchdog_sudo         # needs HERMES_REAL_BIN from install_hermes
   install_mnemosyne
+  ensure_hermes_stt_numpy_compat
 
   # --- Watchdog & service wiring ----------------------------------------------
   write_watchdog
