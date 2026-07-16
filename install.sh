@@ -706,7 +706,64 @@ install_docker() {
 }
 
 # ---------------------------------------------------------------------------
-# Bootstrap file manifest & placeholder resolution
+# ensure_telegram_ipv4_fallback — some hosts resolve api.telegram.org to an
+# IPv6 address with no working route (WSL, some cloud VMs, blocked egress),
+# hanging the Telegram gateway adapter on connect instead of falling back.
+# Probes real IPv6 reachability rather than checking for WSL specifically,
+# and pins IPv4 in /etc/hosts only if the probe fails.
+# ---------------------------------------------------------------------------
+ensure_telegram_ipv4_fallback() {
+  step "Checking IPv6 reachability to api.telegram.org"
+
+  if grep -qE '^\s*[0-9.]+\s+api\.telegram\.org\b' /etc/hosts 2>/dev/null; then
+    ok "api.telegram.org is already pinned in /etc/hosts."
+    return 0
+  fi
+
+  have python3 || { warn "python3 not available; skipping the Telegram IPv6 reachability check."; return 0; }
+
+  # Exit code from the probe: 0 = fine or not applicable (no fix needed),
+  # 1 = IPv6 resolves but doesn't actually connect (fix needed).
+  if python3 - <<'PYEOF'
+import socket
+import sys
+
+try:
+    infos = socket.getaddrinfo("api.telegram.org", 443, socket.AF_INET6)
+except socket.gaierror:
+    # No AAAA record at all — nothing to work around, IPv4 will be used.
+    sys.exit(0)
+
+addr = infos[0][4]
+try:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(addr)
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PYEOF
+  then
+    ok "IPv6 to api.telegram.org is reachable; no pin needed."
+    return 0
+  fi
+
+  warn "api.telegram.org resolves to IPv6 but isn't actually reachable over it (seen on WSL, but can affect any host with broken IPv6 egress). Pinning IPv4 as a workaround."
+
+  local ipv4
+  ipv4="$(python3 -c "import socket; print(socket.getaddrinfo('api.telegram.org', 443, socket.AF_INET)[0][4][0])" 2>/dev/null || true)"
+
+  if [[ -z "$ipv4" ]]; then
+    warn "Could not resolve api.telegram.org over IPv4 either; skipping the pin. If the Telegram gateway adapter hangs in a restart loop, resolve it manually and add it to /etc/hosts."
+    return 0
+  fi
+
+  printf "%s api.telegram.org\n" "$ipv4" | $SUDO tee -a /etc/hosts >/dev/null
+  ok "Pinned api.telegram.org -> ${ipv4} in /etc/hosts (works around the broken IPv6 path)."
+}
+
+
 #
 # Single source of truth for every platform-repo file install.sh either
 # requires to exist (MANDATORY_BOOTSTRAP_FILES) or resolves __PLACEHOLDER__
@@ -1565,6 +1622,7 @@ main() {
   install_opencode
   install_python_yaml
   install_docker
+  ensure_telegram_ipv4_fallback
   install_hermes                # binary only — no platform config applied yet
 
   # --- Platform configuration -------------------------------------------------
