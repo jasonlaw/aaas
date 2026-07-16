@@ -5,7 +5,7 @@ description: Write a platform report after fixing or root-causing a real platfor
 
 # Write Report
 
-Record one Markdown file per finding. That's the whole skill.
+Record one Markdown file per finding, updated in place if the same issue resurfaces later the same day. That's the whole skill.
 
 ## When to write one
 
@@ -37,6 +37,7 @@ Skip the report only when nothing was actually found or fixed — a clean health
 ```markdown
 ---
 timestamp_utc: "{YYYY-MM-DDTHH:MM:SSZ}"
+last_updated_utc: "{YYYY-MM-DDTHH:MM:SSZ}"
 platform_version: "{contents of /opt/aaas/platform/VERSION}"
 trigger: "healthcheck|operator|watchdog"
 author: "opencode|hermes-admin"
@@ -70,16 +71,34 @@ already *is* the correct permanent fix, say that explicitly.
 ## Evidence
 Command output, log lines, error text that justifies the root cause claim.
 Redact secrets (API keys, tokens, credentials).
+
+## Update {HH:MM:SSZ} ({author})
+Only present if the report was updated later the same day (see "Same-day
+duplicate check" below). New findings, fix attempts, or root-cause revisions
+go here, newest at the bottom. Frontmatter `status` is updated in place to
+reflect the current state; the update log preserves the history of how it
+got there.
 ```
 
-Keep it terse. Every section should earn its place — no restating the SOP, no meta-commentary about the report itself.
+`author` in frontmatter records who *created* the file and is never rewritten. Each `## Update` block records its own author inline — either agent may append to any same-day report on the same component regardless of who created it. No handoff or coordination step is needed; whoever finds the follow-up just appends under their own name.
+
+## Same-day duplicate check
+
+Before writing, check only *today's* reports — not the whole directory:
+
+```
+ls /opt/aaas/platform/reports/ | grep "^$(date -u +%Y%m%d)"
+```
+
+- No matches → skip straight to writing a new file. No further reads needed.
+- Matches → open just those files (today's set is normally 0–3) and check `component` in frontmatter.
+  - Same component found → **update that file** instead of creating a new one: append a `## Update {HH:MM:SSZ} ({author})` section, bump `last_updated_utc`, and update `status` in frontmatter if it changed (e.g. `diagnosed-only` → `fixed`). Author of the update need not match the file's original `author`.
+  - No component match → new file as normal.
+
+This check is scoped to today only — never scan the full reports history. Older reports on the same component are a separate, unrelated concern and are not deduplicated against; each day starts a fresh file for a given issue if it recurs.
 
 ## Rules
 
 - Redact secrets: API keys, tokens, credentials, private URLs, tenant private data.
-- One report per finding. Don't merge unrelated findings into one file to save time.
+- One report per finding per day. Don't merge unrelated findings into one file to save time; do update the same file if it's the same finding recurring later today, regardless of who created it originally.
 - If the fix is still just a live workaround and the real setup-level change hasn't been made yet, say so plainly in "Setup-level fix needed" rather than leaving it vague.
-- Hermes admin writes its own reports directly, same as OpenCode — no handoff needed. If Hermes admin ever can't write to `/opt/aaas/platform/reports/` in some deployment, that's itself a setup-level bug: write it up as its own report (author OpenCode, since Hermes admin couldn't — see the invoke-opencode skill for how to hand it off correctly) rather than quietly routing around it.
-- Before writing a new report, skim recent ones for the same component to avoid duplicating a known, already-reported issue:
-  `ls -t /opt/aaas/platform/reports/ | head -20`
-  If it's the same root cause as an existing report, don't write a new file — note the recurrence at the end of the existing one instead.
