@@ -1,3 +1,8 @@
+---
+name: hermes-gateway-recovery
+description: Recover the Hermes admin gateway system service after an AaaS watchdog alert with alert_code "hermes-gateway". Reached via the watchdog-alert skill, which routes to "<alert_code>-recovery". Covers restarting the unit, diagnosing why it won't stay up, checking that Mnemosyne re-initialized, and reporting.
+---
+
 # Hermes Gateway Recovery
 
 Use this skill whenever an AaaS watchdog alert reports the Hermes gateway
@@ -34,8 +39,10 @@ non-interactively without a password prompt.
 - Check `__WATCHDOG_DIR__/watchdog.log` for the failure output.
 - Check `journalctl -u __HERMES_GATEWAY_UNIT__` for the underlying
   systemd/service error.
-- Check Docker is running (`docker info`) if Hermes's terminal backend
-  depends on it.
+- Check Docker is running (`systemctl is-active docker`) if Hermes's
+  terminal backend depends on it. `aaas` is deliberately not in the
+  `docker` group, so `docker info` fails with a permission error; that
+  error is expected and is not the fault.
 - Do NOT reinstall Hermes or edit the wrapper/sudoers as a first response
   — those are intentional and correct; the fix is almost always in the
   gateway process itself.

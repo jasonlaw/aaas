@@ -13,9 +13,9 @@ sudo. Use `systemctl` instead.
 ## Commands
 
 ```bash
-sudo systemctl restart hermes-gateway.service   # restart
-sudo systemctl stop hermes-gateway.service      # stop
-sudo systemctl start hermes-gateway.service     # start
+sudo systemctl restart __HERMES_GATEWAY_UNIT__   # restart
+sudo systemctl stop __HERMES_GATEWAY_UNIT__      # stop
+sudo systemctl start __HERMES_GATEWAY_UNIT__     # start
 hermes gateway status                           # status — CLI is fine for this
 ```
 
@@ -31,9 +31,9 @@ confirm with `hermes gateway status` or by tailing `~/.hermes/logs/gateway.log`.
 ## Pitfalls
 
 - **Don't use `systemctl --user`** — the unit lives at
-  `/etc/systemd/system/hermes-gateway.service`, not a user-level unit.
+  `/etc/systemd/system/__HERMES_GATEWAY_UNIT__`, not a user-level unit.
 - The service runs as `aaas` via a drop-in at
-  `/etc/systemd/system/hermes-gateway.service.d/aaas.conf` — that's already
+  `/etc/systemd/system/__HERMES_GATEWAY_UNIT__.d/aaas.conf` — that's already
   handled by the unit; don't try to `sudo -u aaas` anything yourself.
 - WSL: needs `systemd=true` in `/etc/wsl.conf` or the service won't survive
   WSL session close.

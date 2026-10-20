@@ -53,12 +53,13 @@ Once installed, day-to-day operations — onboarding a tenant, offboarding one, 
 - Away from your machine, message the **Hermes admin** on Telegram — same operational capabilities, reachable from anywhere.
 - Tenant agents notify you by messaging the Hermes admin, which relays the message to you on Telegram. You don't reply to tenants through this channel.
 
-## Installer Prompts
+## After Installing
 
-- primary Hermes provider (default `opencode-zen`) and model (default `big-pickle`)
-- optional fallback provider (default `openrouter`) and model (default `free`)
-- Telegram bot token for the Hermes admin, from BotFather
-- Telegram allowed user IDs, comma-separated — the first one becomes the operator's home channel
+The installer doesn't ask for provider or Telegram settings. Hermes's own wizards set them, and the installer's summary prints the exact commands:
+
+- `sudo -u aaas hermes setup`: primary provider, model, and API key
+- `sudo -u aaas hermes gateway setup`: Telegram bot token (from BotFather) and allowed user IDs
+- then rerun `install.sh` so the platform config is merged into the `config.yaml` the wizard created, and restart the gateway
 
 ## Install Location
 
@@ -74,14 +75,12 @@ AAAS_ROOT="$HOME/aaas-test" bash install.sh
 
 ## Verification
 
-The watchdog only gets enabled after these all check out:
+The watchdog service only gets enabled after these all check out:
 
 - Hermes is installed and the `gateway` command is available
-- Telegram token and allowlist are configured
 - the Hermes admin's gateway system service is running
-- the AaaS watchdog system service can start
 
-Something fails? The installer stops there — fix it and rerun the same command.
+It is enabled but not started. Start it with `sudo systemctl start aaas-watchdog.service`. Something fails? The installer stops there — fix it and rerun the same command.
 
 ## Watchdog Alerts
 
@@ -91,7 +90,13 @@ When the watchdog spots a problem, it drops a timestamped alert folder:
 /opt/aaas/platform/watchdog/alerts/alert-YYYYmmdd-HHMMSS-PID/alert.txt
 ```
 
-If `opencode` is available, the watchdog hands it the alert path and asks it to repair the issue. Once opencode has picked it up, it can remove the whole alert folder.
+A failure that a plain `systemctl restart` can't fix opens **one** incident per alert code. Later checks reuse it instead of creating new folders. If `opencode` is available, the watchdog hands it the alert path to repair, within limits:
+
+- at most 3 attempts per incident (`WATCHDOG_MAX_REPAIRS`)
+- each capped at 15 minutes (`WATCHDOG_REPAIR_TIMEOUT`)
+- spaced 5, then 20 minutes apart (`WATCHDOG_BACKOFF`)
+
+After that it stops and waits for a human. The budget resets only when the watchdog sees the gateway healthy again. Incident state lives in `/opt/aaas/platform/watchdog/state/`.
 
 ## Useful Commands
 
@@ -116,7 +121,7 @@ Three separate `.env` files, each with a single owner — none of them copy valu
 |---|---|---|---|
 | `~/.hermes/.env` | Hermes itself | No — Hermes finds it via `User=aaas` at gateway startup, not via `EnvironmentFile=` | Provider keys, Telegram token/allowlist, `MNEMOSYNE_HOST_LLM_ENABLED`, etc. — anything `hermes setup` or `hermes gateway setup` writes |
 | `/opt/aaas/platform/.env` | `install.sh` | No | `AAAS_ROOT`, `HERMES_REAL_BIN` — install.sh's own bookkeeping across reruns |
-| `/opt/aaas/platform/watchdog/.env` | the watchdog | Yes — `aaas-watchdog.service`'s `EnvironmentFile=` | `HERMES_GATEWAY_UNIT` |
+| `/opt/aaas/platform/watchdog/.env` | the watchdog | Yes — `aaas-watchdog.service`'s `EnvironmentFile=` | `HERMES_GATEWAY_UNIT`; optional `WATCHDOG_MAX_REPAIRS`, `WATCHDOG_REPAIR_TIMEOUT`, `WATCHDOG_BACKOFF` |
 
 If Telegram (or any other Hermes setting) isn't taking effect after a gateway restart, check `~/.hermes/.env` directly — that's the only file the gateway process reads.
 
@@ -135,26 +140,32 @@ Files under `platform/` (skill docs, `.hermes/config.yaml`, etc.) are synced ont
 | `__WATCHDOG_DIR__` | `${PLATFORM_DIR}/watchdog` |
 | `__WATCHDOG_ENV_FILE__` | `${WATCHDOG_DIR}/.env` (the watchdog's own env file — see table above) |
 | `__ALERT_DIR__` | `${WATCHDOG_DIR}/alerts` |
+| `__HERMES_GATEWAY_UNIT__` | the gateway's systemd unit name (second pass, after `hermes gateway install --system`) |
 
-Files requiring every placeholder to resolve successfully (install fails otherwise) are listed in `PLATFORM_PLACEHOLDER_FILES_REQUIRED`; anything else synced under `platform/` is optional and just skipped if absent.
+Files are resolved only if listed in `PLACEHOLDER_RESOLVE_FILES`, and missing ones are skipped with a warning. Files the install can't work without are listed in `MANDATORY_BOOTSTRAP_FILES`, and install fails if any is missing. `__HERMES_GATEWAY_UNIT__` is resolved in a second pass, once the gateway unit exists.
 
 ## `.hermes/config.yaml` Bootstrap Directives
 
 `platform/.hermes/config.yaml` is merged onto the config.yaml Hermes's own setup wizard generates — a real YAML parse/merge, not a text append — then deleted. Per-key merge behavior is controlled by an optional trailing comment directive on that key's own line:
 
 ```yaml
-provider: mnemosyne     # @force     (default if no directive given)
+provider: mnemosyne     # @force
 fallback: openai        # @default
 telegram:                # @disable
+
+# @default
+stt:                     # a directive alone on the line above also works
+  provider: local
 ```
 
 | Directive | Behavior |
 |---|---|
-| `@force` | Always overwrite this key with the bootstrap value, every run. This is also the default when a key has **no** directive at all. |
+| *(none)* | Merge: a dict recurses (sibling keys Hermes generated are kept); any other value overwrites. |
+| `@force` | Always overwrite this key with the bootstrap value, every run. On a dict, the whole subtree is replaced. |
 | `@default` | Only set this key if it's missing from the real config — never clobbers an existing/user-set value. Idempotent: a no-op after the first run. |
 | `@disable` | Always comment this key out of the final `config.yaml`, regardless of what Hermes generated. Top-level keys only. |
 
-All three are idempotent by construction, so no "consumed" bookkeeping or backup-renaming is needed — the bootstrap file can be left in place and rerun safely. A dict-valued key with no explicit directive recurses (sibling keys the bootstrap file doesn't mention are preserved); an explicit `@force` on a dict-valued key replaces that whole subtree atomically instead.
+All of these are idempotent by construction, so no "consumed" bookkeeping or backup-renaming is needed — the bootstrap file can be left in place and rerun safely. Before 0.1.5, a directive alone on its own line was silently ignored, so keys marked `@default` that way were overwritten on every rerun.
 
 
 

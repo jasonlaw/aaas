@@ -1,0 +1,8 @@
+# aaas-embed, tested 2026-09-24 (shared/embed/test_embed.py, 14/14).
+# Tenant image must pin the same mnemosyne-memory version, installed as
+# mnemosyne-memory + numpy + sqlite-vec, without the [embeddings] extra.
+mnemosyne-memory[embeddings]==3.15.1
+fastembed==0.8.1
+onnxruntime==1.30.0
+numpy==2.5.3
+sqlite-vec==0.1.9

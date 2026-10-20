@@ -12,8 +12,9 @@ restarts, and inspects it — it does not (re)install it.
 
 ## Important: this is not a long-running daemon
 
-`watchdog/watchdog.sh` is single-shot: it checks `hermes gateway status
---system` once, starts the gateway if needed, and exits. The unit's
+`watchdog/watchdog.sh` is single-shot: it checks the gateway unit with
+`systemctl is-active`, tries one `systemctl restart` if it's down, and
+exits. The unit's
 `Restart=always` / `RestartSec=20` is what turns that into a ~20s polling
 loop. There is no long-lived `watchdog.sh` process to `pgrep` for — checking
 "is the watchdog running" means checking the *unit's* active state, not a PID.
@@ -24,6 +25,7 @@ loop. There is no long-lived `watchdog.sh` process to `pgrep` for — checking
 - Script: `<watchdog_dir>/watchdog.sh`
 - Log: `<watchdog_dir>/watchdog.log`
 - Alerts: `<watchdog_dir>/alerts/alert-<timestamp>-<pid>/alert.txt`
+- Incident state: `<watchdog_dir>/state/<alert_code>.incident` (open incident, repair attempts, last attempt time)
 - Config sourced by watchdog.sh: `<platform_dir>/watchdog/.env` (its own file — currently just `HERMES_GATEWAY_UNIT`; separate from Hermes's `~/.hermes/.env` and from the platform's `<platform_dir>/.env`)
 - systemd unit: `aaas-watchdog.service` (installed to `/etc/systemd/system/`)
 
@@ -72,6 +74,26 @@ An alert folder existing under `alerts/` means the watchdog (or install.sh)
 already tried to page the admin agent about a failure — surface that to the
 user before declaring things healthy, even if `is-active` says yes.
 
+### How repairs are bounded
+
+A failure the restart can't fix opens **one** incident per `alert_code`,
+tracked in `state/<alert_code>.incident`. Every cycle after that reuses it
+rather than creating new folders. opencode repair runs are limited:
+
+- at most `WATCHDOG_MAX_REPAIRS` attempts (default 3), each capped at
+  `WATCHDOG_REPAIR_TIMEOUT` (default `15m`)
+- spaced by `WATCHDOG_BACKOFF` seconds (default `300 1200 3600`)
+- after that, the log says "waiting for a human" and no more runs happen
+
+The budget only resets when the watchdog sees the gateway healthy again. It
+then appends `resolved_utc:` to `alert.txt` and deletes the state file. To
+start a fresh repair budget by hand after fixing something, delete
+`state/<alert_code>.incident`.
+
+```bash
+cat "${AAAS_ROOT:-/opt/aaas}/platform/watchdog/state/"*.incident 2>/dev/null
+```
+
 ### Start
 
 ```bash
@@ -86,9 +108,8 @@ sudo systemctl is-active --quiet aaas-watchdog.service && echo started
 
 If it fails to become active, don't retry blindly — check
 `systemctl status aaas-watchdog.service --no-pager` and the log tail above
-for the reason first (commonly: `<platform_dir>/watchdog/.env` missing/unreadable, or
-`hermes` not resolvable at `/usr/local/bin/hermes`, which is the symlink
-`ensure_hermes_symlink` sets up during install).
+for the reason first. The usual cause is `<platform_dir>/watchdog/.env`
+being missing or unreadable, or `HERMES_GATEWAY_UNIT` not being set in it.
 
 ### Stop
 
@@ -107,9 +128,9 @@ longer notice or auto-restart the gateway if it goes down.
 sudo systemctl restart aaas-watchdog.service
 ```
 
-Use this after editing `<platform_dir>/watchdog/.env` (e.g. changed
-`HERMES_GATEWAY_UNIT`) — the unit's `EnvironmentFile=` is only read at
-start, so a plain `stop` + wait doesn't pick up edits; `restart` does.
+Rarely needed. `watchdog.sh` re-reads `<platform_dir>/watchdog/.env` on
+every ~20s cycle, so edits take effect on the next cycle. A restart only
+forces that cycle to happen now.
 
 ## What NOT to do here
 
@@ -121,5 +142,7 @@ start, so a plain `stop` + wait doesn't pick up edits; `restart` does.
   script is single-shot, killing a mid-run process doesn't stop the
   service — systemd will just start it again at the next `RestartSec`
   interval. `systemctl stop` is the only correct way to actually halt it.
-- Don't conflate this with restarting the Hermes gateway itself
-  (`hermes gateway restart --system`) — that's a different unit.
+- Don't conflate this with restarting the Hermes gateway itself — that's a
+  different unit, controlled with `sudo systemctl restart
+  __HERMES_GATEWAY_UNIT__` (see manage-hermes-gateway-service). Never use
+  `hermes gateway restart`.

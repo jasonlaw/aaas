@@ -300,7 +300,9 @@ write_alert() {
   printf "[%s] %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$message" | run_as_aaas tee "${alert_path}/alert.txt" >/dev/null
   warn "$message"
   if have opencode; then
-    (cd "$PLATFORM_DIR" && opencode run "AaaS installer alert: $message. Inspect ${alert_path}/alert.txt, repair the issue, rerun install.sh if needed, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
+    # As aaas so files it writes get the right owner (see invoke-opencode
+    # skill); time-boxed so a stuck repair can't hang the installer.
+    (cd "$PLATFORM_DIR" && run_as_aaas timeout 15m opencode run "AaaS installer alert: $message. Inspect ${alert_path}/alert.txt, repair the issue, rerun install.sh if needed, then remove the folder ${alert_path} after picking up this alert.") >>"$LOG_FILE" 2>&1 || true
   fi
 }
 
@@ -636,19 +638,29 @@ install_python_yaml() {
   fi
 }
 
+# The docker group is root-equivalent, and aaas runs LLM agents reachable
+# over Telegram. Earlier releases added aaas to it; take it back out.
+# Skipped if the operator pointed Hermes's terminal at Docker, which needs it.
+ensure_aaas_not_in_docker_group() {
+  local hermes_config="${AAAS_HOME}/.hermes/config.yaml"
+
+  id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker || return 0
+
+  if [[ -f "$hermes_config" ]] && grep -Eq '^[[:space:]]*backend:[[:space:]]*["'"'"']?docker' "$hermes_config"; then
+    warn "${AAAS_USER} is in the docker group (root-equivalent), kept because Hermes's terminal backend is docker in ${hermes_config}."
+    return 0
+  fi
+
+  run $SUDO gpasswd -d "$AAAS_USER" docker >/dev/null
+  ok "Removed ${AAAS_USER} from the docker group (root-equivalent)."
+}
+
 install_docker() {
   step "Installing Docker Engine"
 
   if have docker; then
     ok "Docker is already available."
-    if getent group docker >/dev/null 2>&1; then
-      if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
-        run $SUDO usermod -aG docker "$AAAS_USER"
-        ok "Added ${AAAS_USER} to the docker group."
-      else
-        ok "${AAAS_USER} is already in the docker group."
-      fi
-    fi
+    ensure_aaas_not_in_docker_group
     return
   fi
 
@@ -695,12 +707,7 @@ install_docker() {
     run $SUDO systemctl enable --now docker || true
   fi
 
-  if getent group docker >/dev/null 2>&1; then
-    if ! id -nG "$AAAS_USER" 2>/dev/null | grep -qw docker; then
-      run $SUDO usermod -aG docker "$AAAS_USER"
-      ok "Added ${AAAS_USER} to the docker group."
-    fi
-  fi
+  ensure_aaas_not_in_docker_group
 
   have docker && ok "Docker is installed." || warn "Docker still needs manual installation."
 }
@@ -791,6 +798,8 @@ declare -a PLACEHOLDER_RESOLVE_FILES=(
   ".hermes/config.yaml"
   ".hermes/SOUL.md"
   ".opencode/skills/hermes-gateway-recovery/SKILL.md"
+  ".opencode/skills/manage-watchdog-service/SKILL.md"
+  ".agents/skills/manage-hermes-gateway-service/SKILL.md"
 )
 
 declare -A BOOTSTRAP_PLACEHOLDERS=()
@@ -967,47 +976,22 @@ WRAPPER
   fi
 }
 
-# ---------------------------------------------------------------------------
-# ensure_watchdog_sudo — scoped, passwordless sudo for aaas to run ONLY
-# "$HERMES_REAL_BIN gateway ..." as root. Used for diagnostics only (e.g.
-# `hermes gateway status --system`) — the actual restart/health-check path
-# goes through systemctl directly (see ensure_watchdog_systemctl_sudo),
-# since the hermes CLI's guard wrapper (blocks non-aaas) and the --system
-# subcommands' root requirement can never both be satisfied by one process.
-#
-# Scoped to the exact resolved binary path plus a literal "gateway"
-# subcommand, so a compromised watchdog process can't sudo anything else.
-# ---------------------------------------------------------------------------
-ensure_watchdog_sudo() {
-  step "Granting scoped sudo for Hermes gateway control (diagnostics)"
-
-  [[ -n "$HERMES_REAL_BIN" ]] || fail "HERMES_REAL_BIN is not set. ensure_hermes_wrapper must run before ensure_watchdog_sudo."
-  [[ -n "$SUDO" || "${EUID:-$(id -u)}" -eq 0 ]] || fail "Granting sudo rules requires root or sudo."
-  have visudo || fail "visudo is required to safely install the watchdog sudoers rule."
+# Earlier releases granted aaas NOPASSWD sudo on "$HERMES_REAL_BIN gateway *".
+# That binary lives in aaas's own home, so aaas could replace it and run
+# anything as root. Nothing uses the rule any more (gateway control goes
+# through ensure_watchdog_systemctl_sudo), so remove it from existing hosts.
+remove_legacy_hermes_gateway_sudoers() {
+  step "Removing legacy Hermes gateway sudoers rule"
 
   local sudoers_file="/etc/sudoers.d/aaas-hermes-gateway"
-  local rule="${AAAS_USER} ALL=(root) NOPASSWD: ${HERMES_REAL_BIN} gateway *"
-  local tmp_sudoers
-  tmp_sudoers="$(mktemp)"
 
-  if [[ -f "$sudoers_file" ]] && grep -Fxq "$rule" "$sudoers_file" 2>/dev/null; then
-    ok "Sudoers rule already present and matches current Hermes binary path."
-    rm -f "$tmp_sudoers"
+  if ! $SUDO test -e "$sudoers_file"; then
+    ok "No legacy rule at ${sudoers_file}."
     return
   fi
 
-  printf '%s\n' "$rule" >"$tmp_sudoers"
-  chmod 0440 "$tmp_sudoers"
-
-  if ! $SUDO visudo -cf "$tmp_sudoers" >/dev/null 2>&1; then
-    rm -f "$tmp_sudoers"
-    fail "Generated sudoers rule failed visudo syntax check; not installed."
-  fi
-
-  run $SUDO install -m 0440 -o root -g root "$tmp_sudoers" "$sudoers_file"
-  rm -f "$tmp_sudoers"
-  ok "Installed scoped sudoers rule at ${sudoers_file}."
-  ok "aaas may now run: sudo ${HERMES_REAL_BIN} gateway <start|stop|restart|status> --system (NOPASSWD, diagnostics only)."
+  run $SUDO rm -f "$sudoers_file"
+  ok "Removed ${sudoers_file} (it let ${AAAS_USER} gain root via an ${AAAS_USER}-writable binary)."
 }
 
 # ---------------------------------------------------------------------------
@@ -1015,7 +999,8 @@ ensure_watchdog_sudo() {
 # run ONLY `systemctl {start,stop,restart,is-active,status} <exact-unit>`
 # as root. This is the PRIMARY mechanism watchdog.sh, the recovery skill,
 # and summary() use to control the Hermes gateway service, sidestepping
-# the wrapper-vs-root conflict noted above.
+# the conflict between the hermes guard wrapper (aaas only) and the
+# --system subcommands (root only).
 #
 # Scoped to the exact unit name (not a wildcard), so a compromised
 # watchdog process can't restart/stop arbitrary services. Call only after
@@ -1105,11 +1090,19 @@ bootstrap = yaml.safe_load(bootstrap_text) or {}
 
 DIRECTIVE_RE = re.compile(r'#\s*@(force|default|disable)\b')
 KEY_RE = re.compile(r'^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_.-]+):')
+# A directive alone on a comment line applies to the next key.
+STANDALONE_RE = re.compile(r'^\s*#\s*@(force|default|disable)\s*$')
 
 directive_map = {}
 stack = []
+pending = None
 for line in bootstrap_text.splitlines():
-    if not line.strip() or line.lstrip().startswith('#'):
+    if not line.strip():
+        continue
+    if line.lstrip().startswith('#'):
+        sm = STANDALONE_RE.match(line)
+        if sm:
+            pending = sm.group(1)
         continue
     m = KEY_RE.match(line)
     if not m:
@@ -1123,6 +1116,9 @@ for line in bootstrap_text.splitlines():
     dm = DIRECTIVE_RE.search(line)
     if dm:
         directive_map[dotted] = dm.group(1)
+    elif pending:
+        directive_map[dotted] = pending
+    pending = None
 
 disabled_paths = []
 
@@ -1274,11 +1270,8 @@ ensure_venv_ensurepip_support() {
 # --no-bootstrap guarantees the tool's own profile-ignorant auto-bootstrap
 # never fires as a side effect.
 #
-# The platform/.hermes/config.yaml bootstrap must set:
-#   memory:
-#     memory_enabled: false        — disables built-in MEMORY.md injection
-#     user_profile_enabled: false  — disables built-in USER.md injection
-#     provider: mnemosyne
+# The platform/.hermes/config.yaml bootstrap sets memory.provider:
+# mnemosyne and caps the built-in MEMORY.md/USER.md at 200 characters.
 #
 # IMPORTANT: do NOT use `hermes tools disable memory` — that also kills
 # all Mnemosyne-registered tools. Use memory_enabled: false instead.
@@ -1581,7 +1574,7 @@ verify_hermes_runtime() {
     resolve_gateway_unit_placeholder "$unit_name"
 
     # Health-check and start/restart via systemctl directly, not the
-    # hermes CLI — see the wrapper-vs-root note above.
+    # hermes CLI — see ensure_watchdog_systemctl_sudo for why.
     if ! $SUDO systemctl is-active --quiet "$unit_name"; then
       run $SUDO systemctl start "$unit_name"
     else
@@ -1717,7 +1710,7 @@ main() {
   configure_hermes_platform
 
   # --- Mnemosyne memory ---------------------------------------------------------
-  ensure_watchdog_sudo         # needs HERMES_REAL_BIN from install_hermes
+  remove_legacy_hermes_gateway_sudoers
   install_mnemosyne
   ensure_hermes_stt_numpy_compat
 
